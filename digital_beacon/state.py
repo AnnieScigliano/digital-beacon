@@ -83,6 +83,20 @@ class VoiceParameterStore:
         self._strum_times: list[float] = []       # recent strum timestamps
         self._on_change = on_change
         self._panic_callback: Optional[Callable[[], None]] = None
+        # ─── Hybrid sensor state ───────────────────────────────────────────
+        self._hybrid_mode: int = 0              # 0=HR, 1=IMU, 2=Hybrid
+        self._hybrid_bpm: float = 0.0
+        self._hybrid_rr_ms: float = 0.0
+        self._hybrid_confidence: float = 0.0
+        self._hybrid_yaw: float = 0.0
+        self._hybrid_pitch: float = 0.0
+        self._hybrid_roll: float = 0.0
+        self._hybrid_ax: float = 0.0
+        self._hybrid_ay: float = 0.0
+        self._hybrid_az: float = 0.0
+        self._hybrid_clock_ts: float = 0.0
+        self._hybrid_clock_seq: int = 0
+        self._hybrid_bpm_ref: float = config.HYBRID_BPM_REF
 
     # ─── Internal helpers ─────────────────────────────────────────────────
 
@@ -320,6 +334,54 @@ class VoiceParameterStore:
                              for i in range(1, len(self._strum_times))]
                 self._strum_period_s = sum(intervals) / len(intervals)
 
+    # ─── Hybrid sensor setters ────────────────────────────────────────────────────
+
+    def set_hybrid_clock(self, timestamp: float, seq: int, bpm_ref: float) -> None:
+        with self._lock:
+            self._hybrid_clock_ts = timestamp
+            self._hybrid_clock_seq = seq
+            self._hybrid_bpm_ref = bpm_ref
+
+    def update_hybrid_hr(self, bpm: float, rr_ms: float, confidence: float = 1.0) -> None:
+        with self._lock:
+            self._hybrid_bpm = bpm
+            self._hybrid_rr_ms = rr_ms
+            self._hybrid_confidence = confidence
+        self._notify()
+
+    def update_hybrid_imu(self, yaw: float, pitch: float, roll: float,
+                          ax: float, ay: float, az: float) -> None:
+        with self._lock:
+            self._hybrid_yaw = yaw
+            self._hybrid_pitch = pitch
+            self._hybrid_roll = roll
+            self._hybrid_ax = ax
+            self._hybrid_ay = ay
+            self._hybrid_az = az
+        self._notify()
+
+    def set_hybrid_mode(self, mode: int) -> None:
+        with self._lock:
+            self._hybrid_mode = mode
+        self._notify()
+
+    # ─── Hybrid sensor getters (for audio engine + API) ─────────────────────────
+
+    def get_hybrid_hr(self) -> tuple[float, float, float]:
+        with self._lock:
+            return self._hybrid_bpm, self._hybrid_rr_ms, self._hybrid_confidence
+
+    def get_hybrid_imu(self) -> tuple[float, float, float, float, float, float]:
+        with self._lock:
+            return (self._hybrid_yaw, self._hybrid_pitch, self._hybrid_roll,
+                    self._hybrid_ax, self._hybrid_ay, self._hybrid_az)
+
+    def get_hybrid_mode(self) -> int:
+        with self._lock:
+            return self._hybrid_mode
+
+    # ─── Panic ───────────────────────────────────────────────────────────────
+
     def panic(self) -> None:
         with self._lock:
             for v in self._voices.values():
@@ -328,6 +390,10 @@ class VoiceParameterStore:
                 v.pan = 0.0
                 v.phase = 0.0
             self._active_history.clear()
+            # Reset hybrid state
+            self._hybrid_bpm = 0.0
+            self._hybrid_yaw = 0.0
+            self._hybrid_pitch = 0.0
         self._notify()
         # Also notify the MIDI control (Launchpad) to clear lights + state
         if self._panic_callback:
@@ -336,7 +402,7 @@ class VoiceParameterStore:
             except Exception:
                 pass
 
-    # ─── Snapshot accessors ───────────────────────────────────────────────
+    # ─── Snapshot accessors ───────────────────────────────────────────────────────
 
     def get_snapshot(self) -> dict[int, VoiceParams]:
         """Active voices only — for the audio callback (hot path)."""
@@ -361,6 +427,18 @@ class VoiceParameterStore:
                 "lfo_waveform": self._lfo_waveform,
                 "lfo_amount": self._lfo_amount,
                 "strum_period_s": round(self._strum_period_s, 3),
+                "hybrid": {
+                    "mode": self._hybrid_mode,
+                    "bpm": self._hybrid_bpm,
+                    "rr_ms": self._hybrid_rr_ms,
+                    "confidence": self._hybrid_confidence,
+                    "yaw": self._hybrid_yaw,
+                    "pitch": self._hybrid_pitch,
+                    "roll": self._hybrid_roll,
+                    "ax": self._hybrid_ax,
+                    "ay": self._hybrid_ay,
+                    "az": self._hybrid_az,
+                },
                 "voices": {
                     str(k): {
                         "gain": v.gain,

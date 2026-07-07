@@ -25,6 +25,60 @@ This repo is the new home of a unified toolkit built from:
 | `nh-renderers` | Python/sounddevice (reference), WebAudio AudioWorklet, SuperCollider OSC |
 | `nh-runtime` | WebSocket base-field server + local model client |
 
+## Hybrid Sensor Mode (v1.0) — NEW
+
+`digital-beacon` now supports a **Hybrid Sensor Mode** that combines:
+- **Fitbit Charge 6** heart rate (via BLE real-time beat events)
+- **Phone IMU** (gyroscope + accelerometer via HTTP POST)
+- **Temporal sync** between both sensor streams
+
+### How it works
+
+```
+Fitbit Charge 6 (BLE) ──► hr_relay.py ──► hybrid_bridge.py ──► /hybrid/hr ──► SC
+Phone IMU (HTTP) ───────► POST /imu ───► hybrid_bridge.py ──► /hybrid/imu ──► SC
+                                              │
+                                              ▼
+                                    temporal sync + beat clock
+                                              │
+                                              ▼
+                              Shaper audio_engine.py (HR→gain/shape, IMU→pan)
+```
+
+### Creative mappings
+
+| Sensor | Target | Effect |
+|--------|--------|--------|
+| HR BPM | Master gain | ±5% pulse around 72 BPM reference |
+| HR BPM | Band gain (upper) | Brighter/darker spectral shift |
+| IMU Yaw | Azimuth rotation | Head-tracking spatial rotation |
+| IMU Pitch | Front band gain | Elevation tilt (front/back) |
+| IMU Accel | Master gain | Movement → brightness |
+
+### Running with Hybrid Mode
+
+```bash
+./start.sh --hybrid --live    # Enable hybrid sensors + live input
+./start.sh --hybrid --file    # Enable hybrid sensors + WAV file
+```
+
+The hybrid bridge runs on port 8081 (IMU HTTP endpoint) and forwards
+temporal-sync OSC to the SC engine on port 57120.
+
+### Direct HTTP endpoints (bypass bridge)
+
+```bash
+curl -X POST http://localhost:8080/api/hybrid/hr \
+  -H "Content-Type: application/json" \
+  -d '{"bpm": 85, "rr_ms": 705, "confidence": 0.95}'
+
+curl -X POST http://localhost:8080/api/hybrid/imu \
+  -H "Content-Type: application/json" \
+  -d '{"yaw": 15, "pitch": -5, "roll": 0, "ax": 0.1, "ay": 0, "az": 9.8}'
+
+curl http://localhost:8080/api/hybrid/status
+```
+
 ## Protocols
 
 - `docs/protocols/websocket-messages.md` — canonical internal control plane

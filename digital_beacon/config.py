@@ -35,6 +35,21 @@ SCLANG_HOST = "127.0.0.1"
 
 OSC_HOST = "0.0.0.0"      # bind for listeners
 
+# ─── Hybrid Sensor Mode (v1.0) ───────────────────────────────────────────────
+# Fitbit HR + Phone IMU bridge configuration
+HYBRID_ENABLED = True
+HYBRID_OSC_PORT = 9003        # hybrid_bridge listens here (not 9001/9002)
+HYBRID_IMU_PORT = 5051        # HTTP endpoint for phone IMU data
+HYBRID_BPM_REF = 72.0         # reference BPM for sync
+HYBRID_CLOCK_INTERVAL = 1.0   # seconds between /sync/clock broadcasts
+
+# Sensor → audio mapping depths (0..1 scale)
+HYBRID_HR_GAIN_DEPTH = 0.15   # max ±gain modulation from HR
+HYBRID_HR_SHAPE_DEPTH = 0.25  # max shape modulation from HR
+HYBRID_YAW_AZ_RANGE = 90.0    # yaw ±180° → azimuth ±90°
+HYBRID_PITCH_DIST_RANGE = 5.0 # pitch ±90° → distance ±5
+HYBRID_ACCEL_GAIN_BOOST = 0.3  # accel magnitude → gain boost
+
 # ─── Beacon-spatial legacy port (older /beacon/* messages) ──────────────────
 # digital-beacon ALSO listens on the legacy 9001 broadcast port.
 # The old schema (13 bands) is not consumed — only /beacon/voice/* and

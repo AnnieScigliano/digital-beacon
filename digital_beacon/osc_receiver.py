@@ -79,6 +79,11 @@ class ShaperOSCReceiver:
         d.map("/beacon/f1", self._on_f1)
         d.map("/beacon/panic", lambda *_: self._store.panic())
         d.map("/beacon/level", self._on_beacon_level)
+        # Hybrid sensor protocol
+        d.map("/sync/clock", self._on_sync_clock)
+        d.map("/bridge/heartbeat", self._on_bridge_heartbeat)
+        d.map("/spatial/imu", self._on_spatial_imu)
+        d.map("/hybrid/mode", self._on_hybrid_mode)
         d.set_default_handler(lambda *_: None)
 
         try:
@@ -114,6 +119,31 @@ class ShaperOSCReceiver:
 
     def _on_beacon_level(self, addr, level, *_):
         self._store.set_beacon_level(float(level))
+
+    # ─── Hybrid sensor protocol ───────────────────────────────────────────
+
+    def _on_sync_clock(self, addr, timestamp, seq, bpm_ref, *_):
+        """Receive sync clock from hybrid bridge."""
+        self._store.set_hybrid_clock(float(timestamp), int(seq), float(bpm_ref))
+        log.debug("sync/clock seq=%d bpm_ref=%.1f", int(seq), float(bpm_ref))
+
+    def _on_bridge_heartbeat(self, addr, timestamp, seq, bpm, rr_ms, confidence, *_):
+        """Receive heart rate data from hybrid bridge."""
+        self._store.update_hybrid_hr(float(bpm), float(rr_ms), float(confidence))
+        log.debug("bridge/heartbeat seq=%d bpm=%.1f rr=%.0fms", int(seq), float(bpm), float(rr_ms))
+
+    def _on_spatial_imu(self, addr, timestamp, seq, yaw, pitch, roll, ax, ay, az, *_):
+        """Receive IMU frame from hybrid bridge."""
+        self._store.update_hybrid_imu(
+            float(yaw), float(pitch), float(roll),
+            float(ax), float(ay), float(az)
+        )
+        log.debug("spatial/imu seq=%d yaw=%.1f pitch=%.1f", int(seq), float(yaw), float(pitch))
+
+    def _on_hybrid_mode(self, addr, timestamp, seq, mode, *_):
+        """Receive hybrid mode announcement."""
+        self._store.set_hybrid_mode(int(mode))
+        log.info("hybrid/mode seq=%d mode=%d", int(seq), int(mode))
 
     # ─── Direct shaper control (/digital/*) ───────────────────────────────
 

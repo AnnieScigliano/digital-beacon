@@ -12,9 +12,11 @@ Adapted from NaturalHarmony/harmonic_shaper/audio_engine.py:
 
 import logging
 import threading
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
+
+import math
 
 try:
     import sounddevice as sd
@@ -36,14 +38,15 @@ class AudioEngine:
         self,
         store: VoiceParameterStore,
         sample_rate: int = config.AUDIO_SAMPLE_RATE,
-        block_size: int = config.AUDIO_BLOCK_SIZE,
-        device: Optional[int | str] = config.AUDIO_DEVICE,
-    ):
+        device: Optional[Union[int, str]] = config.AUDIO_DEVICE,
+        channels: int = 2,
+        blocksize: int = config.AUDIO_BLOCK_SIZE,
+    ) -> None:
         if not HAS_SOUNDDEVICE:
             raise ImportError("sounddevice is required. pip install sounddevice")
         self._store = store
         self._sample_rate = sample_rate
-        self._block_size = block_size
+        self._block_size = blocksize
         self._device = device
         self._stream: Optional["sd.OutputStream"] = None
         # Per-voice state: {harmonic_n: {"phase": float, "env": float, "params": VoiceParams}}
@@ -144,6 +147,30 @@ class AudioEngine:
 
         mix = np.zeros((frames, 2), dtype=np.float32)
 
+        # ── Hybrid sensor modulation (computed BEFORE voice loop for thread safety) ──
+        # HR → subtle master gain pulse + per-voice shape modulation
+        bpm, rr_ms, hr_conf = self._store.get_hybrid_hr()
+        hr_pulse = 0.0
+        hr_shape_mod = 0.0
+        if bpm > 0:
+            # Normalize BPM around 72: 72 → 0, range ±30 → ±depth
+            bpm_norm = (bpm - 72.0) / 30.0
+            bpm_norm = max(-1.0, min(1.0, bpm_norm))
+            hr_pulse = bpm_norm * config.HYBRID_HR_GAIN_DEPTH
+            hr_shape_mod = bpm_norm * config.HYBRID_HR_SHAPE_DEPTH
+
+        # IMU → per-voice pan modulation (yaw) + gain boost (accel)
+        yaw, pitch, roll, ax, ay, az = self._store.get_hybrid_imu()
+        imu_pan_mod = 0.0
+        imu_gain_boost = 0.0
+        if abs(yaw) > 0.01 or abs(pitch) > 0.01:
+            # Yaw → pan offset (±90° yaw → ±0.3 pan)
+            yaw_norm = yaw / 180.0  # -1..1
+            imu_pan_mod = yaw_norm * 0.3
+            # Accel magnitude → gain boost
+            accel_mag = math.sqrt(ax*ax + ay*ay + az*az)
+            imu_gain_boost = min(accel_mag / 20.0, 1.0) * config.HYBRID_ACCEL_GAIN_BOOST
+
         to_prune = []
         for n, state in self._voice_state.items():
             params = state["params"]
@@ -190,16 +217,27 @@ class AudioEngine:
 
             # ── Waveshaper (didgeridoo/vocal timbre) ──────────────────
             shape = params.shape
-            if shape > 0.0:
-                drive = 1.0 + shape * 4.0
+            # Apply HR shape modulation
+            voice_shape = shape + hr_shape_mod
+            voice_shape = max(0.0, min(1.0, voice_shape))
+            if voice_shape > 0.0:
+                drive = 1.0 + voice_shape * 4.0
                 sine = np.tanh(sine * drive) / np.tanh(drive)
 
-            sine *= float(mod_gain) * norm * new_env
+            # Apply IMU gain boost
+            voice_gain = mod_gain * (1.0 + imu_gain_boost)
+            voice_gain = min(voice_gain, 1.0)
+
+            sine *= float(voice_gain) * norm * new_env
             state["phase"] = (
                 carrier_phases[-1] + 2.0 * np.pi * params.freq / self._sample_rate
             ) % (2.0 * np.pi)
 
-            angle = (float(mod_pan) + 1.0) * (np.pi / 4.0)
+            # Apply IMU pan modulation to the voice
+            voice_pan = mod_pan + imu_pan_mod
+            voice_pan = max(-1.0, min(1.0, voice_pan))
+
+            angle = (float(voice_pan) + 1.0) * (np.pi / 4.0)
             mix[:, 0] += sine * float(np.cos(angle))
             mix[:, 1] += sine * float(np.sin(angle))
 
@@ -214,8 +252,8 @@ class AudioEngine:
         else:
             sc_factor = 1.0 + abs(sidechain_amount) * (1.0 - beacon_level)
 
-        # Master gain + side-chain + soft limiter
-        mix *= self._store.get_master_gain() * sc_factor
+        # Master gain + side-chain + HR pulse + soft limiter
+        mix *= self._store.get_master_gain() * sc_factor * (1.0 + hr_pulse)
 
         # ── Recording tap: hand a copy of the final mix to the recorder
         #    BEFORE the soft limiter, so the Recorder can do its own

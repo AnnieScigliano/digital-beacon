@@ -27,7 +27,7 @@
 var nBands = 32;
 var defaultF1 = 40.0;
 var buf, decoder, synth, oscdefs;
-var audioFilePath = "/home/nicolas/Projects/beacon-spatial/harmonic_beacon_2026_05_13_session.wav";
+var audioFilePath = Platform.resourceDir +/+ "sounds/harmonic_beacon_2026_05_13_session.wav";
 var useFile = "BEACON_SOURCE".getenv == "file";
 var defName = if (useFile) { \digital_beacon_file } { \digital_beacon_live };
 
@@ -275,7 +275,99 @@ server.doWhenBooted({
     "[RESET] All bands restored.".postln;
   }, "/beacon/reset"));
 
-  "OSCdefs registered: 32 gain + 32 az + 32 on + vsource + f1 + master + panic + reset (98 total).".postln;
+  // ─── Hybrid sensor OSCdefs ────────────────────────────────────────────────
+  // These receive from hybrid_bridge.py (port 9003) and modulate the
+  // binaural spatializer in real-time with body sensor data.
+
+  // /hybrid/hr — Heart Rate → master gain pulse + band shape modulation
+  // BPM > 72 → brighter (more shape), BPM < 72 → darker (less shape)
+  oscdefs = oscdefs.add(OSCdef(\hybrid_hr, { |msg|
+    var bpm = msg[1].asFloat;
+    var rr_ms = msg[2].asFloat;
+    var confidence = msg[3].asFloat;
+    var bpm_norm = ((bpm - 72) / 30).clip(-1.0, 1.0);
+    var hr_pulse = bpm_norm * 0.05;  // ±5% master gain
+    var hr_shape = bpm_norm * 0.15;  // ±15% shape modulation
+
+    // Apply master gain pulse
+    var current_master = master0;  // base
+    synth.set(\master, (current_master * (1.0 + hr_pulse)).clip(0.0, 3.0));
+
+    // Modulate shape of all active bands
+    nBands.do { |i|
+      var n = i + 1;
+      var current_gain = defaultGains[i];
+      // Subtle brightness shift: higher BPM → slightly higher gain on upper bands
+      var band_shift = if (i > 15) { hr_shape * 0.3 } { 0 };
+      synth.set(("gain" ++ n).asSymbol, (current_gain + band_shift).clip(0.0, 3.0));
+    };
+
+    "  [HYBRID HR] BPM=%  RR=%ms  conf=%  pulse=%  shape=%".format(
+      bpm.round(0.1), rr_ms.round(0.1), confidence.round(2), hr_pulse.round(3), hr_shape.round(3)
+    ).postln;
+  }, "/hybrid/hr"));
+
+  // /hybrid/imu — IMU orientation → azimuth rotation + elevation tilt
+  // Yaw → rotate all azimuths, Pitch → elevation (not directly in FoaPanB,
+  // so we map to subtle gain modulation on front/back bands)
+  oscdefs = oscdefs.add(OSCdef(\hybrid_imu, { |msg|
+    var yaw = msg[1].asFloat;    // -180..180
+    var pitch = msg[2].asFloat;  // -90..90
+    var roll = msg[3].asFloat;   // -180..180
+    var ax = msg[4].asFloat;
+    var ay = msg[5].asFloat;
+    var az = msg[6].asFloat;
+
+    // Yaw → rotate all azimuths by yaw offset
+    var yaw_offset = yaw.clip(-180, 180);
+    nBands.do { |i|
+      var n = i + 1;
+      var base_az = defaultAz[i];
+      var new_az = (base_az + yaw_offset).wrap(-180, 180);
+      synth.set(("az" ++ n).asSymbol, new_az);
+    };
+
+    // Pitch → subtle elevation: tilt forward (pitch > 0) → boost front bands
+    // We approximate by modulating gain on bands with az near 0°
+    var pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.2;
+    nBands.do { |i|
+      var n = i + 1;
+      var base_az = defaultAz[i];
+      var is_front = (base_az.abs < 45);
+      if (is_front) {
+        var current_gain = defaultGains[i];
+        synth.set(("gain" ++ n).asSymbol, (current_gain + pitch_mod).clip(0.0, 3.0));
+      };
+    };
+
+    // Acceleration magnitude → subtle global brightness
+    var accel_mag = (ax.squared + ay.squared + az.squared).sqrt;
+    var accel_boost = (accel_mag / 20).clip(0, 1) * 0.1;
+    synth.set(\master, (master0 * (1.0 + accel_boost)).clip(0.0, 3.0));
+
+    "  [HYBRID IMU] yaw=%°  pitch=%°  roll=%°  accel=%  boost=%".format(
+      yaw.round(0.1), pitch.round(0.1), roll.round(0.1), accel_mag.round(1), accel_boost.round(3)
+    ).postln;
+  }, "/hybrid/imu"));
+
+  // /hybrid/mode — switch between HR-only, IMU-only, or Hybrid
+  oscdefs = oscdefs.add(OSCdef(\hybrid_mode, { |msg|
+    var mode = msg[1].asInteger;  // 0=HR, 1=IMU, 2=Hybrid
+    var mode_name = ["HR-ONLY", "IMU-ONLY", "HYBRID"][mode.clip(0, 2)];
+    "  [HYBRID MODE] %".format(mode_name).postln;
+  }, "/hybrid/mode"));
+
+  // /hybrid/sync/clock — temporal sync pulse (for visual or rhythmic feedback)
+  oscdefs = oscdefs.add(OSCdef(\hybrid_sync, { |msg|
+    var timestamp = msg[1].asFloat;
+    var seq = msg[2].asInteger;
+    var bpm_ref = msg[3].asFloat;
+    // Optional: flash a brief visual cue or trigger a one-shot event
+    // For now, just log at debug level
+    // "  [HYBRID SYNC] ts=%  seq=%  bpm_ref=%".format(timestamp, seq, bpm_ref).postln;
+  }, "/hybrid/sync/clock"));
+
+  "OSCdefs registered: 32 gain + 32 az + 32 on + vsource + f1 + master + panic + reset + hybrid (102 total).".postln;
 
   // Cleanup
   ServerQuit.add({

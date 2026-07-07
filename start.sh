@@ -12,6 +12,7 @@
 #   ./start.sh --live             (SoundIn(0) — R24 CH1)
 #   ./start.sh --no-shaper        (beacon only)
 #   ./start.sh --no-bridge        (beacon + shaper, f1 stays fixed)
+#   ./start.sh --hybrid           (enable Fitbit HR + Phone IMU bridge)
 #
 # Hard stop: Ctrl-C cleans up all child PIDs.
 
@@ -24,6 +25,7 @@ cd "$SCRIPT_DIR"
 USE_FILE=0
 RUN_SHAPER=1
 RUN_BRIDGE=1
+RUN_HYBRID=0
 EXTRA_PY_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -32,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --live)        USE_FILE=0; shift ;;
     --no-shaper)   RUN_SHAPER=0; shift ;;
     --no-bridge)   RUN_BRIDGE=0; shift ;;
+    --hybrid)      RUN_HYBRID=1; shift ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -41,7 +44,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Verify the audio source file exists when --file
-AUDIO_FILE="/home/nicolas/Projects/beacon-spatial/harmonic_beacon_2026_05_13_session.wav"
+AUDIO_FILE="${AUDIO_FILE:-/Users/altermundi/Downloads/harmonic_beacon_2026_05_13_session.wav}"
 if [[ $USE_FILE -eq 1 && ! -f "$AUDIO_FILE" ]]; then
   echo "ERROR: audio source not found: $AUDIO_FILE"
   echo "Use --live to use SoundIn(0) instead."
@@ -71,9 +74,9 @@ prekill() {
   sleep 1.0
   # Belt-and-suspenders: explicitly free any port still bound
   local freed=0
-  for port in 57110 57120 9001 9002; do
+  for port in 57110 57120 9001 9002 8081; do
     local pids
-    pids=$(ss -ulnpH 2>/dev/null | awk -v p=":$port" '$0 ~ p' | grep -oP 'pid=\K[0-9]+' | sort -u)
+    pids=$(ss -ulnpH 2>/dev/null | awk -v p=":$port" '$0 ~ p' | grep -o 'pid=[0-9]*' | sed 's/pid=//' | sort -u)
     for pid in $pids; do
       if kill -0 "$pid" 2>/dev/null; then
         kill -9 "$pid" 2>/dev/null || true
@@ -89,10 +92,20 @@ prekill() {
 }
 prekill
 
-# ─── 1. pw-jack + scsynth ────────────────────────────────────────────────────
+# ─── 1. scsynth ────────────────────────────────────────────────────────────
 echo ""
-echo ">>> [1/4] Starting pw-jack scsynth on :57110 ..."
-pw-jack scsynth -u 57110 -i 2 -o 2 > /tmp/digital-beacon-scsynth.log 2>&1 &
+echo ">>> [1/4] Starting scsynth on :57110 ..."
+
+# macOS: scsynth is inside SuperCollider.app bundle
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  SCSYNTH_BIN="/Applications/SuperCollider.app/Contents/Resources/scsynth"
+  SCLANG_BIN="/Applications/SuperCollider.app/Contents/MacOS/sclang"
+else
+  SCSYNTH_BIN="scsynth"
+  SCLANG_BIN="sclang"
+fi
+
+"$SCSYNTH_BIN" -u 57110 -i 2 -o 2 > /tmp/digital-beacon-scsynth.log 2>&1 &
 SCSYNTH_PID=$!
 echo "  scsynth PID: $SCSYNTH_PID"
 
@@ -120,23 +133,23 @@ for i in {1..20}; do
   fi
 done
 
-# Connect scsynth outputs to system playback.
-# With pw-jack the JACK client name is "SuperCollider" (not "scsynth" as in
-# old jackd setups). We try to connect to whichever playback sink exists:
-# the R24 (capture/playback card) and the Built-in Audio fallback.
-sleep 0.5
-CONNECTED=0
-for sink in 'R24 Analog Stereo' 'Built-in Audio Analog Stereo'; do
-  if pw-jack jack_connect "SuperCollider:out_1" "${sink}:playback_FL" 2>/dev/null; then
-    pw-jack jack_connect "SuperCollider:out_2" "${sink}:playback_FR" 2>/dev/null || true
-    echo "  SuperCollider:out connected to ${sink}"
-    CONNECTED=1
-    break
+# Connect scsynth outputs to system playback (Linux PipeWire only).
+# macOS uses CoreAudio directly — no manual connection needed.
+if [[ "$OSTYPE" != "darwin"* ]]; then
+  sleep 0.5
+  CONNECTED=0
+  for sink in 'R24 Analog Stereo' 'Built-in Audio Analog Stereo'; do
+    if pw-jack jack_connect "SuperCollider:out_1" "${sink}:playback_FL" 2>/dev/null; then
+      pw-jack jack_connect "SuperCollider:out_2" "${sink}:playback_FR" 2>/dev/null || true
+      echo "  SuperCollider:out connected to ${sink}"
+      CONNECTED=1
+      break
+    fi
+  done
+  if [[ $CONNECTED -eq 0 ]]; then
+    echo "  WARNING: could not auto-connect SuperCollider to any playback sink."
+    echo "  Run: pw-jack jack_connect SuperCollider:out_1 <sink>:playback_FL"
   fi
-done
-if [[ $CONNECTED -eq 0 ]]; then
-  echo "  WARNING: could not auto-connect SuperCollider to any playback sink."
-  echo "  Run: pw-jack jack_connect SuperCollider:out_1 <sink>:playback_FL"
 fi
 
 # ─── 2. sclang (beacon.scd) ─────────────────────────────────────────────────
@@ -156,7 +169,7 @@ if pid == 0:
     # Child: exec sclang
     os.environ['BEACON_SOURCE'] = '$BEACON_SOURCE'
     os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-    os.execvp('sclang', ['sclang', '-u', '57120', 'beacon.scd'])
+    os.execvp('$SCLANG_BIN', ['$SCLANG_BIN', '-u', '57120', 'beacon.scd'])
 else:
     # Parent: read from pty, write to log
     def reader():
@@ -180,27 +193,42 @@ echo "  sclang PID: $SCLANG_PID  (log: $SCLANG_LOG)"
 BRIDGE_PID=
 if [[ $RUN_BRIDGE -eq 1 ]]; then
   echo ""
-  echo ">>> [3/4] Starting f1_bridge.py ..."
+  echo ">>> [3/5] Starting f1_bridge.py ..."
   ./venv/bin/python3 f1_bridge.py > /tmp/digital-beacon-bridge.log 2>&1 &
   BRIDGE_PID=$!
   echo "  bridge PID: $BRIDGE_PID  (log: /tmp/digital-beacon-bridge.log)"
 else
   echo ""
-  echo ">>> [3/4] Skipping f1_bridge (--no-bridge)"
+  echo ">>> [3/5] Skipping f1_bridge (--no-bridge)"
 fi
 
-# ─── 4. digital_beacon Shaper ────────────────────────────────────────────────
+# ─── 4. hybrid_bridge (Hybrid Sensor Mode) ──────────────────────────────────
+HYBRID_PID=
+if [[ $RUN_HYBRID -eq 1 ]]; then
+  echo ""
+  echo ">>> [4/5] Starting hybrid_bridge.py (Fitbit HR + Phone IMU) ..."
+  ./venv/bin/python3 hybrid_bridge.py --imu-port 5051 > /tmp/digital-beacon-hybrid.log 2>&1 &
+  HYBRID_PID=$!
+  echo "  hybrid PID: $HYBRID_PID  (log: /tmp/digital-beacon-hybrid.log)"
+  echo "  IMU endpoint: POST http://localhost:5051/imu"
+  echo "  Connect phone IMU app to this endpoint"
+else
+  echo ""
+  echo ">>> [4/5] Skipping hybrid_bridge (use --hybrid to enable)"
+fi
+
+# ─── 5. digital_beacon Shaper ────────────────────────────────────────────────
 SHAPER_PID=
 if [[ $RUN_SHAPER -eq 1 ]]; then
   echo ""
-  echo ">>> [4/4] Starting digital_beacon Shaper (MIDI + OSC + audio) ..."
+  echo ">>> [5/5] Starting digital_beacon Shaper (MIDI + OSC + audio) ..."
   ./venv/bin/python3 -m digital_beacon.main "${EXTRA_PY_ARGS[@]}" \
     > /tmp/digital-beacon-shaper.log 2>&1 &
   SHAPER_PID=$!
   echo "  shaper PID: $SHAPER_PID  (log: /tmp/digital-beacon-shaper.log)"
 else
   echo ""
-  echo ">>> [4/4] Skipping shaper (--no-shaper)"
+  echo ">>> [5/5] Skipping shaper (--no-shaper)"
 fi
 
 # ─── Trap for clean shutdown ─────────────────────────────────────────────────
@@ -208,16 +236,16 @@ cleanup() {
   echo ""
   echo "=== Shutting down digital-beacon ==="
   # SIGTERM the tracked PIDs first
-  for pid in $SHAPER_PID $BRIDGE_PID $SCLANG_PID $SCSYNTH_PID; do
+  for pid in $SHAPER_PID $BRIDGE_PID $HYBRID_PID $SCLANG_PID $SCSYNTH_PID; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill -TERM "$pid" 2>/dev/null || true
     fi
   done
   sleep 0.5
   # Kill anything else still holding our ports (orphans, grandchildren)
-  for port in 57110 57120 9001 9002; do
+  for port in 57110 57120 9001 9002 8081; do
     local pids
-    pids=$(ss -ulnpH 2>/dev/null | awk -v p=":$port" '$0 ~ p' | grep -oP 'pid=\K[0-9]+' | sort -u)
+    pids=$(ss -ulnpH 2>/dev/null | awk -v p=":$port" '$0 ~ p' | grep -o 'pid=[0-9]*' | sed 's/pid=//' | sort -u)
     for pid in $pids; do
       if kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true
@@ -225,7 +253,7 @@ cleanup() {
     done
   done
   # Final SIGKILL on tracked PIDs
-  for pid in $SHAPER_PID $BRIDGE_PID $SCLANG_PID $SCSYNTH_PID; do
+  for pid in $SHAPER_PID $BRIDGE_PID $HYBRID_PID $SCLANG_PID $SCSYNTH_PID; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill -KILL "$pid" 2>/dev/null || true
     fi
@@ -238,20 +266,20 @@ trap cleanup INT TERM
 echo ""
 echo "=========================================="
 echo "  digital-beacon running"
-echo "  PIDs: scsynth=$SCSYNTH_PID sclang=$SCLANG_PID bridge=$BRIDGE_PID shaper=$SHAPER_PID"
+echo "  PIDs: scsynth=$SCSYNTH_PID sclang=$SCLANG_PID bridge=$BRIDGE_PID hybrid=$HYBRID_PID shaper=$SHAPER_PID"
 echo "  Logs:"
 echo "    scsynth: tail -f /tmp/digital-beacon-scsynth.log"
 echo "    sclang:  tail -f /tmp/digital-beacon-sclang.log"
 echo "    bridge:  tail -f /tmp/digital-beacon-bridge.log"
+echo "    hybrid:  tail -f /tmp/digital-beacon-hybrid.log"
 echo "    shaper:  tail -f /tmp/digital-beacon-shaper.log"
 echo "  Dashboard: http://localhost:8080  (or http://<lan-ip>:8080)"
 echo "  Stop:    Ctrl-C"
 echo "=========================================="
 echo ""
 
-# Wait for any tracked child to die. The scsynth-died check inside the boot
-# loop already exited with error; once we're here, all four are alive.
-wait -n $SCSYNTH_PID $SCLANG_PID ${BRIDGE_PID:-0} ${SHAPER_PID:-0} 2>/dev/null || true
+# scsynth-died check inside the boot loop already exited with error; once we're here, all five are alive.
+wait -n $SCSYNTH_PID $SCLANG_PID ${BRIDGE_PID:-0} ${HYBRID_PID:-0} ${SHAPER_PID:-0} 2>/dev/null || true
 EXITED=$?
 echo "A child process exited (wait rc=$EXITED). Cleaning up..."
 cleanup

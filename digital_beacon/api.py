@@ -387,6 +387,64 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
                     store.set_lfo_phase(n, float(vp["lfo_phase"]))
         return {"ok": True, "name": name, "state": state}
 
+    # ─── REST: Hybrid Sensor endpoints ────────────────────────────────────
+    @app.get("/api/hybrid/status")
+    async def hybrid_status():
+        """Return current hybrid sensor state (HR + IMU + mode)."""
+        bpm, rr_ms, conf = store.get_hybrid_hr()
+        yaw, pitch, roll, ax, ay, az = store.get_hybrid_imu()
+        return {
+            "ok": True,
+            "mode": store.get_hybrid_mode(),
+            "hr": {
+                "bpm": bpm,
+                "rr_ms": rr_ms,
+                "confidence": conf,
+            },
+            "imu": {
+                "yaw": yaw,
+                "pitch": pitch,
+                "roll": roll,
+                "ax": ax,
+                "ay": ay,
+                "az": az,
+            },
+        }
+
+    @app.post("/api/hybrid/mode")
+    async def set_hybrid_mode(body: dict):
+        """Switch hybrid mode: 0=HR-only, 1=IMU-only, 2=Hybrid."""
+        mode = int(body.get("mode", 2))
+        store.set_hybrid_mode(mode)
+        # Also notify the bridge via OSC
+        sc_osc.send_message("/hybrid/mode", [mode])
+        return {"ok": True, "mode": mode}
+
+    @app.post("/api/hybrid/imu")
+    async def post_hybrid_imu(body: dict):
+        """Direct HTTP endpoint for phone IMU data (alternative to bridge)."""
+        yaw = float(body.get("yaw", 0.0))
+        pitch = float(body.get("pitch", 0.0))
+        roll = float(body.get("roll", 0.0))
+        ax = float(body.get("ax", 0.0))
+        ay = float(body.get("ay", 0.0))
+        az = float(body.get("az", 0.0))
+        store.update_hybrid_imu(yaw, pitch, roll, ax, ay, az)
+        # Forward to SC for spatial modulation
+        sc_osc.send_message("/hybrid/imu", [yaw, pitch, roll, ax, ay, az])
+        return {"ok": True, "imu": {"yaw": yaw, "pitch": pitch, "roll": roll}}
+
+    @app.post("/api/hybrid/hr")
+    async def post_hybrid_hr(body: dict):
+        """Direct HTTP endpoint for heart rate data (alternative to bridge)."""
+        bpm = float(body.get("bpm", 0.0))
+        rr_ms = float(body.get("rr_ms", 0.0))
+        confidence = float(body.get("confidence", 1.0))
+        store.update_hybrid_hr(bpm, rr_ms, confidence)
+        # Forward to SC for gain/shape modulation
+        sc_osc.send_message("/hybrid/hr", [bpm, rr_ms, confidence])
+        return {"ok": True, "hr": {"bpm": bpm, "rr_ms": rr_ms}}
+
     # ─── REST: Recording (pw-record on PipeWire monitor) ────────────────
     @app.get("/api/record/status")
     async def record_status():
