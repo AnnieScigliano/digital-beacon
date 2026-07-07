@@ -24,25 +24,30 @@ El venv ya tiene `bleak`, `flask`, `python-osc`, `numpy`, etc. instalados.
 
 Esto levanta:
 - scsynth (57110)
-- sclang + beacon.scd (57120)
-- f1_bridge (9002)
-- **hybrid_bridge.py** (9003 OSC + 5051 HTTP)
+- sclang + beacon.scd o beacon_simple.scd si no tenés el quark ATK instalado (57120)
+- f1_bridge (9001)
+- **hybrid_bridge.py** (5051 HTTP para IMU; manda por OSC a sclang :57120)
 - Shaper audio engine (8080)
 
 Esperá a que veas `Hybrid Sensor Bridge v1.0` en los logs.
 
-## Paso 3: Conectar el Fitbit Charge 6
+## Paso 3: Conectar un sensor de HR real (opcional)
 
-### 3a. En el Fitbit:
-- Deslizá hacia arriba → **Ejercicio** → seleccioná cualquier actividad (ej: "Yoga")
-- El Fitbit ahora transmite HR por BLE cada 1-2 segundos
+**Importante:** un Fitbit Charge 6 no expone el perfil BLE HR estándar a apps
+de terceros (confirmado por escaneo en vivo) — `--mode ble` no lo va a
+encontrar. Necesitás una banda de pecho BLE genérica (Polar H10, COOSPO
+H6/H64, Magene H64, etc). Sin una de esas, saltá este paso — `hybrid_bridge.py`
+ya genera HR simulado por defecto (ver logs `[HYBRID HR]`).
+
+### 3a. En el sensor:
+- Ponételo y activalo (algunas bandas necesitan humedecer los electrodos)
 
 ### 3b. En el Mac (nueva terminal):
 
 ```bash
 cd ~/Documents/AlterMundi/Beacon/cymatic-control
 source venv/bin/activate  # o el venv que uses
-python hr_relay.py --mode ble --target digital-beacon --device "Charge 6"
+python hr_relay.py --mode ble --target digital-beacon --device "Polar"
 ```
 
 Si no tenés venv en cymatic-control:
@@ -51,18 +56,23 @@ Si no tenés venv en cymatic-control:
 cd ~/Documents/AlterMundi/Beacon/cymatic-control
 python3 -m venv venv
 source venv/bin/activate
-pip install bleak requests-oauthlib
-python hr_relay.py --mode ble --target digital-beacon --device "Charge 6"
+pip install -r requirements.txt
+python hr_relay.py --mode ble --target digital-beacon --device "Polar"
 ```
 
 Deberías ver:
 ```
-  [target] digital-beacon mode: OSC -> 127.0.0.1:9003
-  Scanning for BLE Heart Rate sensors...
-  Found HR sensor: Charge 6 (XX:XX:XX:XX:XX:XX)
-  Streaming heart rate from Charge 6...
+  [target] digital-beacon mode: OSC -> 127.0.0.1:57120
+  [target] Sends /hybrid/hr [bpm, rr_ms, confidence] directly to sclang
+  Scanning for BLE devices...
+  Checking each device for the Heart Rate Service (0x180D)...
+  Found HR sensor: Polar H10 (XX:XX:XX:XX:XX:XX)
+  Streaming heart rate from Polar H10...
   ♥ beat #1  72 BPM  (RR: 833ms)
 ```
+
+Este camino manda directo a sclang, en paralelo a lo que ya genera
+`hybrid_bridge.py` — ambos conviven sin pisarse.
 
 ## Paso 4: Conectar el teléfono (IMU)
 
