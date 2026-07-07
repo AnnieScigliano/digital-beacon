@@ -62,7 +62,7 @@ Phone IMU (HTTP) ───────► POST /imu ───► hybrid_bridge.p
 ./start.sh --hybrid --file    # Enable hybrid sensors + WAV file
 ```
 
-The hybrid bridge runs on port 8081 (IMU HTTP endpoint) and forwards
+The hybrid bridge runs on port 5051 (IMU HTTP endpoint) and forwards
 temporal-sync OSC to the SC engine on port 57120.
 
 ### Direct HTTP endpoints (bypass bridge)
@@ -85,6 +85,17 @@ curl http://localhost:8080/api/hybrid/status
 - `docs/protocols/sensor-event.md` — normalized sensor event schema
 - `docs/protocols/osc-bridge.md` — OSC edge/gateway compatibility layer
 
+## Stack
+
+- `scsynth` + `sclang` + ATK (Ambisonic Toolkit) — binaural engine (falls back
+  to `beacon_simple.scd`, no ATK required, when the quark isn't installed)
+- `pw-jack` (PipeWire) — audio backend on Linux; macOS uses CoreAudio directly,
+  no JACK wrapper needed
+- `sounddevice` (PortAudio) — Shaper audio engine
+- `python-osc` — control bus
+- `mido` — Launchpad Mini + Minilab3 MIDI
+- `fastapi` + WebSocket — optional web control surface
+
 ## Roadmap
 
 See `docs/ROADMAP_foundational_toolkit_2026-07-06.md`.
@@ -92,6 +103,7 @@ See `docs/ROADMAP_foundational_toolkit_2026-07-06.md`.
 ## How to run tests
 
 ```bash
+# Run package tests
 cd ~/Projects/digital-beacon
 python3 -m venv .venv
 source .venv/bin/activate
@@ -99,6 +111,11 @@ pip install -e packages/nh-core -e packages/nh-presets -e packages/nh-model \
     -e packages/nh-control -e packages/nh-analysis -e packages/nh-sensors \
     -e packages/nh-renderers -e packages/nh-runtime
 pytest packages/
+
+# Run the legacy instrument end-to-end
+cd ~/Documents/AlterMundi/Beacon/digital-beacon
+./start.sh --file                  # beacon + shaper + bridge, source = WAV
+./start.sh --live                  # beacon source = SoundIn(0) [R24 CH1]
 ```
 
 ## Legacy architecture

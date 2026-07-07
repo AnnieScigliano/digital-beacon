@@ -27,7 +27,7 @@
 var nBands = 32;
 var defaultF1 = 40.0;
 var buf, decoder, synth, oscdefs;
-var audioFilePath = Platform.resourceDir +/+ "sounds/harmonic_beacon_2026_05_13_session.wav";
+var audioFilePath = "AUDIO_FILE".getenv ?? (Platform.resourceDir +/+ "sounds/harmonic_beacon_2026_05_13_session.wav");
 var useFile = "BEACON_SOURCE".getenv == "file";
 var defName = if (useFile) { \digital_beacon_file } { \digital_beacon_live };
 
@@ -276,8 +276,10 @@ server.doWhenBooted({
   }, "/beacon/reset"));
 
   // ─── Hybrid sensor OSCdefs ────────────────────────────────────────────────
-  // These receive from hybrid_bridge.py (port 9003) and modulate the
-  // binaural spatializer in real-time with body sensor data.
+  // These receive on this sclang's own OSC port (57120) from either
+  // hybrid_bridge.py's internal BLE/simulate capture or api.py's
+  // /api/hybrid/* HTTP endpoints, and modulate the binaural spatializer
+  // in real-time with body sensor data.
 
   // /hybrid/hr — Heart Rate → master gain pulse + band shape modulation
   // BPM > 72 → brighter (more shape), BPM < 72 → darker (less shape)
@@ -288,9 +290,10 @@ server.doWhenBooted({
     var bpm_norm = ((bpm - 72) / 30).clip(-1.0, 1.0);
     var hr_pulse = bpm_norm * 0.05;  // ±5% master gain
     var hr_shape = bpm_norm * 0.15;  // ±15% shape modulation
+    var current_master, band_shift;
 
     // Apply master gain pulse
-    var current_master = master0;  // base
+    current_master = master0;  // base
     synth.set(\master, (current_master * (1.0 + hr_pulse)).clip(0.0, 3.0));
 
     // Modulate shape of all active bands
@@ -298,7 +301,7 @@ server.doWhenBooted({
       var n = i + 1;
       var current_gain = defaultGains[i];
       // Subtle brightness shift: higher BPM → slightly higher gain on upper bands
-      var band_shift = if (i > 15) { hr_shape * 0.3 } { 0 };
+      band_shift = if (i > 15) { hr_shape * 0.3 } { 0 };
       synth.set(("gain" ++ n).asSymbol, (current_gain + band_shift).clip(0.0, 3.0));
     };
 
@@ -317,9 +320,10 @@ server.doWhenBooted({
     var ax = msg[4].asFloat;
     var ay = msg[5].asFloat;
     var az = msg[6].asFloat;
+    var yaw_offset, pitch_mod, accel_mag, accel_boost;
 
     // Yaw → rotate all azimuths by yaw offset
-    var yaw_offset = yaw.clip(-180, 180);
+    yaw_offset = yaw.clip(-180, 180);
     nBands.do { |i|
       var n = i + 1;
       var base_az = defaultAz[i];
@@ -329,7 +333,7 @@ server.doWhenBooted({
 
     // Pitch → subtle elevation: tilt forward (pitch > 0) → boost front bands
     // We approximate by modulating gain on bands with az near 0°
-    var pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.2;
+    pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.2;
     nBands.do { |i|
       var n = i + 1;
       var base_az = defaultAz[i];
@@ -341,8 +345,8 @@ server.doWhenBooted({
     };
 
     // Acceleration magnitude → subtle global brightness
-    var accel_mag = (ax.squared + ay.squared + az.squared).sqrt;
-    var accel_boost = (accel_mag / 20).clip(0, 1) * 0.1;
+    accel_mag = (ax.squared + ay.squared + az.squared).sqrt;
+    accel_boost = (accel_mag / 20).clip(0, 1) * 0.1;
     synth.set(\master, (master0 * (1.0 + accel_boost)).clip(0.0, 3.0));
 
     "  [HYBRID IMU] yaw=%°  pitch=%°  roll=%°  accel=%  boost=%".format(

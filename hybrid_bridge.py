@@ -6,12 +6,11 @@ Combines:
   - Temporal synchronization protocol with timestamps and sequence numbers
   - OSC output to the digital-beacon engine (sclang :57120)
 
-Protocol OSC (all messages carry [timestamp, seq] prefix):
-  /sync/clock        [timestamp, seq, bpm_ref]          — sync heartbeat
-  /bridge/heartbeat  [timestamp, seq, bpm, rr_ms, confidence]  — HR data
-  /spatial/imu       [timestamp, seq, yaw, pitch, roll, ax, ay, az] — IMU frame
-  /spatial/imu_bundle [bundle]                          — bundled IMU
-  /hybrid/mode       [timestamp, seq, mode]            — 0=HR, 1=IMU, 2=Hybrid
+Protocol OSC (addresses/arg shapes match the OSCdefs registered in beacon.scd):
+  /hybrid/sync/clock [timestamp, seq, bpm_ref]          — sync heartbeat
+  /hybrid/hr         [bpm, rr_ms, confidence]           — HR data
+  /hybrid/imu        [yaw, pitch, roll, ax, ay, az]      — IMU frame
+  /hybrid/mode       [mode]                             — 0=HR, 1=IMU, 2=Hybrid
 
 Creative mappings (enforced by beacon.scd + Shaper):
   HR (bpm)    → subtle master gain pulse + Shaper shape modulation + breathing LFO
@@ -44,8 +43,6 @@ from typing import Optional
 
 try:
     from pythonosc.udp_client import SimpleUDPClient
-    from pythonosc.osc_server import BlockingOSCUDPServer
-    from pythonosc import dispatcher as osc_dispatcher
     HAS_OSC = True
 except ImportError:
     HAS_OSC = False
@@ -68,7 +65,6 @@ log = logging.getLogger("hybrid_bridge")
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-DEFAULT_HYBRID_OSC_PORT = 9003          # bridge listens here (not 9001/9002)
 DEFAULT_IMU_HTTP_PORT = 5051            # phone IMU posts here
 DEFAULT_BPM_REF = 72.0                  # reference BPM for sync
 HR_TO_GAIN_DEPTH = 0.15                 # max ±gain modulation from HR
@@ -117,6 +113,7 @@ class SensorState:
             self.rr_ms = rr_ms
             self.confidence = confidence
             self.last_hr_time = time.time()
+        self.next_seq()
 
     def update_imu(self, yaw: float, pitch: float, roll: float,
                    ax: float, ay: float, az: float):
@@ -128,6 +125,7 @@ class SensorState:
             self.ay = ay
             self.az = az
             self.last_imu_time = time.time()
+        self.next_seq()
 
     def set_mode(self, mode: int):
         with self._lock:
@@ -178,29 +176,26 @@ class HybridOSCProtocol:
         """Broadcast sync clock with reference BPM."""
         seq = self._next_seq()
         ts = self._now()
-        self._client.send_message("/sync/clock", [ts, seq, bpm_ref])
-        log.debug("/sync/clock seq=%d bpm_ref=%.1f", seq, bpm_ref)
+        self._client.send_message("/hybrid/sync/clock", [ts, seq, bpm_ref])
+        log.debug("/hybrid/sync/clock seq=%d bpm_ref=%.1f", seq, bpm_ref)
 
     def send_heartbeat(self, bpm: float, rr_ms: float, confidence: float = 1.0):
-        """Send heart rate data with temporal stamp."""
+        """Send heart rate data. Address/arg shape matches beacon.scd's \\hybrid_hr OSCdef."""
         seq = self._next_seq()
-        ts = self._now()
-        self._client.send_message("/bridge/heartbeat", [ts, seq, bpm, rr_ms, confidence])
-        log.debug("/bridge/heartbeat seq=%d bpm=%.1f rr=%.0fms", seq, bpm, rr_ms)
+        self._client.send_message("/hybrid/hr", [bpm, rr_ms, confidence])
+        log.debug("/hybrid/hr seq=%d bpm=%.1f rr=%.0fms", seq, bpm, rr_ms)
 
     def send_imu(self, yaw: float, pitch: float, roll: float,
                  ax: float, ay: float, az: float):
-        """Send IMU frame with temporal stamp."""
+        """Send IMU frame. Address/arg shape matches beacon.scd's \\hybrid_imu OSCdef."""
         seq = self._next_seq()
-        ts = self._now()
-        self._client.send_message("/spatial/imu", [ts, seq, yaw, pitch, roll, ax, ay, az])
-        log.debug("/spatial/imu seq=%d yaw=%.1f pitch=%.1f roll=%.1f", seq, yaw, pitch, roll)
+        self._client.send_message("/hybrid/imu", [yaw, pitch, roll, ax, ay, az])
+        log.debug("/hybrid/imu seq=%d yaw=%.1f pitch=%.1f roll=%.1f", seq, yaw, pitch, roll)
 
     def send_mode(self, mode: int):
-        """Announce hybrid mode change."""
+        """Announce hybrid mode change. Arg shape matches beacon.scd's \\hybrid_mode OSCdef."""
         seq = self._next_seq()
-        ts = self._now()
-        self._client.send_message("/hybrid/mode", [ts, seq, mode])
+        self._client.send_message("/hybrid/mode", [mode])
         log.info("/hybrid/mode seq=%d mode=%d (%s)", seq, mode,
                  ["HR", "IMU", "Hybrid"][mode])
 
@@ -443,8 +438,6 @@ def main():
                         help="BLE scan timeout (default: 10s)")
     parser.add_argument("--imu-port", type=int, default=DEFAULT_IMU_HTTP_PORT,
                         help=f"HTTP port for IMU endpoint (default: {DEFAULT_IMU_HTTP_PORT})")
-    parser.add_argument("--osc-port", type=int, default=DEFAULT_HYBRID_OSC_PORT,
-                        help=f"OSC listen port (default: {DEFAULT_HYBRID_OSC_PORT})")
     parser.add_argument("--target-host", default="127.0.0.1",
                         help="Target OSC host (default: 127.0.0.1)")
     parser.add_argument("--target-port", type=int, default=57120,
@@ -464,7 +457,7 @@ def main():
     log.info("  HR mode:  %s", args.mode)
     log.info("  IMU port: %d", args.imu_port)
     log.info("  OSC out:  %s:%d  ->  sclang", args.target_host, args.target_port)
-    log.info("  Protocol: /sync/clock, /bridge/heartbeat, /spatial/imu, /hybrid/mode")
+    log.info("  Protocol: /hybrid/sync/clock, /hybrid/hr, /hybrid/imu, /hybrid/mode")
     log.info("=" * 55)
 
     # Start clock sync thread

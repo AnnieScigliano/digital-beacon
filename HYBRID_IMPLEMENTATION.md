@@ -13,50 +13,48 @@ The Hybrid Sensor Mode adds a new layer to the digital-beacon instrument:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Fitbit Charge 6 (BLE)                                                          │
-│      │                                                                          │
-│      ▼                                                                          │
-│  hr_relay.py --target digital-beacon                                             │
-│      │                                                                          │
-│      ▼  /bridge/heartbeat [bpm, rr_ms]                                         │
-│  hybrid_bridge.py (port 9003)                                                   │
-│      │                                                                          │
-│      ▼  /hybrid/hr [bpm, rr_ms, confidence]                                     │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-                           ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-                           │  SuperCollider (sclang:57120)                                                   │
-                           │      │                                                                          │
-                           │      ▼  OSCdef(\hybrid_hr) → master gain + band gain                            │
-                           │      ▼  OSCdef(\hybrid_imu) → azimuth rotation + front gain                     │
-                           │      ▼  OSCdef(\hybrid_mode) → mode switch                                       │
-                           │      ▼  OSCdef(\hybrid_sync) → temporal sync                                      │
-                           └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-                           ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-                           │  Shaper audio_engine.py                                                           │
-                           │      │                                                                          │
-                           │      ▼  HR → master gain pulse (±5% around 72 BPM)                                │
-                           │      ▼  HR → shape modulation (brightness/darkness)                             │
-                           │      ▼  IMU → per-voice pan modulation (yaw → spatial)                         │
-                           │      ▼  IMU → gain boost (acceleration → brightness)                             │
-                           └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+There are two independent ways sensor data reaches sclang — both send the same
+`/hybrid/*` OSC addresses directly to `127.0.0.1:57120`, no relay hop between
+them:
 
-┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  Phone (Web Sensors API)                                                         │
-│      │                                                                          │
-│      ▼  POST /imu {yaw, pitch, roll, ax, ay, az}                                │
-│  hybrid_bridge.py (port 8081)                                                    │
-│      │                                                                          │
-│      ▼  /hybrid/imu [yaw, pitch, roll, ax, ay, az]                             │
-└──────────────────────────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼ (same SC + Shaper path as HR above)
 ```
+┌────────────────────────────────────────────┐   ┌────────────────────────────────────────────┐
+│  Fitbit Charge 6 / BLE HR strap             │   │  Phone (Web Sensors API)                    │
+│      │ BLE                                  │   │      │ POST /imu {yaw,pitch,roll,ax,ay,az}   │
+│      ▼                                      │   │      ▼                                      │
+│  hybrid_bridge.py --mode ble  (this host)   │   │  hybrid_bridge.py Flask :5051 /imu           │
+│      │  or  hr_relay.py --target            │   │      │                                      │
+│      │      digital-beacon (cymatic-control)│   │      ▼  /hybrid/imu [yaw,pitch,roll,ax,ay,az]│
+│      ▼  /hybrid/hr [bpm, rr_ms, confidence] │   └────────────────────────────────────────────┘
+└────────────────────────────────────────────┘
+                     │                                              │
+                     ▼                                              ▼
+              ┌──────────────────────────────────────────────────────────────┐
+              │  SuperCollider (sclang :57120)                                │
+              │      OSCdef(\hybrid_hr)   → master gain + band gain          │
+              │      OSCdef(\hybrid_imu)  → azimuth rotation + front gain    │
+              │      OSCdef(\hybrid_mode) → mode switch                      │
+              │      OSCdef(\hybrid_sync) → temporal sync (from clock thread)│
+              └──────────────────────────────────────────────────────────────┘
+
+A third path bypasses hybrid_bridge.py entirely: api.py's HTTP endpoints
+(/api/hybrid/hr, /api/hybrid/imu, /api/hybrid/mode) update the Shaper's own
+state store AND forward the same /hybrid/* OSC messages to sclang — this is
+the path the curl-based tests in HYBRID_TESTING_GUIDE.md exercise:
+
+┌────────────────────────────────────────────┐
+│  curl / any HTTP client                     │
+│      ▼  POST /api/hybrid/hr, /imu, /mode    │
+│  digital_beacon/api.py :8080                │
+│      ├─▶ store.update_hybrid_*()  (Shaper)  │
+│      └─▶ sc_osc.send_message("/hybrid/...") ─┼─▶ sclang :57120 (same OSCdefs as above)
+└────────────────────────────────────────────┘
+```
+
+`digital_beacon/osc_receiver.py` also has handlers listening on port 9001 for
+an older `/bridge/heartbeat` / `/spatial/imu` addressing scheme intended for a
+future "Shaper" ingestion path — nothing currently sends to those addresses,
+so they're dormant. Not part of the flow above.
 
 ## Files Modified/Created
 
@@ -83,7 +81,7 @@ The Hybrid Sensor Mode adds a new layer to the digital-beacon instrument:
 
 | File | Changes |
 |------|---------|
-| `hr_relay.py` | Added `--target digital-beacon` option (auto-configures port 9003) |
+| `hr_relay.py` | Added `--target digital-beacon` option — sends `/hybrid/hr` directly to sclang on 127.0.0.1:57120 |
 
 ### Modified Files (beacon-spatial)
 
@@ -93,23 +91,21 @@ The Hybrid Sensor Mode adds a new layer to the digital-beacon instrument:
 
 ## OSC Protocol
 
-### Inbound (to SC, from hybrid_bridge.py)
+### Inbound to sclang (port 57120) — sent by hybrid_bridge.py or api.py
 
-| Address | Args | Source | Description |
-|---------|------|--------|-------------|
-| `/hybrid/hr` | `[bpm, rr_ms, confidence]` | hybrid_bridge.py | Heart rate data |
-| `/hybrid/imu` | `[yaw, pitch, roll, ax, ay, az]` | hybrid_bridge.py | IMU orientation + accel |
-| `/hybrid/mode` | `[mode]` | hybrid_bridge.py | 0=HR, 1=IMU, 2=Hybrid |
-| `/hybrid/sync/clock` | `[timestamp, seq, bpm_ref]` | hybrid_bridge.py | Temporal sync heartbeat |
+| Address | Args | Description |
+|---------|------|-------------|
+| `/hybrid/hr` | `[bpm, rr_ms, confidence]` | Heart rate data |
+| `/hybrid/imu` | `[yaw, pitch, roll, ax, ay, az]` | IMU orientation + accel |
+| `/hybrid/mode` | `[mode]` | 0=HR, 1=IMU, 2=Hybrid |
+| `/hybrid/sync/clock` | `[timestamp, seq, bpm_ref]` | Temporal sync heartbeat (hybrid_bridge.py only) |
 
-### Inbound (to hybrid_bridge.py)
+`hybrid_bridge.py` has no inbound OSC receiver — it only ever sources HR/IMU
+itself (BLE/simulate modes, and its own `/imu` HTTP endpoint) and sends
+outbound to sclang. `hr_relay.py --target digital-beacon` sends `/hybrid/hr`
+straight to sclang too, independently of `hybrid_bridge.py`.
 
-| Address | Args | Source | Description |
-|---------|------|--------|-------------|
-| `/bridge/heartbeat` | `[bpm, rr_ms]` | hr_relay.py | BLE heart rate from Fitbit |
-| `/spatial/imu` | `[yaw, pitch, roll, ax, ay, az]` | Phone/HTTP | IMU data from phone sensors |
-
-### HTTP Endpoints (direct to API, bypassing bridge)
+### HTTP Endpoints (direct to API, independent of hybrid_bridge.py)
 
 | Method | Endpoint | Body | Description |
 |--------|----------|------|-------------|
@@ -146,12 +142,11 @@ All hybrid settings are in `digital_beacon/config.py`:
 ```python
 # Hybrid Sensor Mode (v1.0)
 HYBRID_ENABLED = True
-HYBRID_OSC_PORT = 9003        # hybrid_bridge listens here
-HYBRID_IMU_PORT = 8081        # HTTP server for phone IMU
-HYBRID_BPM_REF = 72.0         # Reference BPM for normalization
-HYBRID_HR_GAIN_DEPTH = 0.03   # ±3% master gain at ±30 BPM
-HYBRID_HR_SHAPE_DEPTH = 0.05  # ±5% shape modulation at ±30 BPM
-HYBRID_ACCEL_GAIN_BOOST = 0.02 # 2% gain boost per 20 m/s²
+HYBRID_IMU_PORT = 5051         # HTTP server for phone IMU (hybrid_bridge.py)
+HYBRID_BPM_REF = 72.0          # Reference BPM for normalization
+HYBRID_HR_GAIN_DEPTH = 0.15    # ±15% master gain at ±30 BPM
+HYBRID_HR_SHAPE_DEPTH = 0.25   # ±25% shape modulation at ±30 BPM
+HYBRID_ACCEL_GAIN_BOOST = 0.3  # 30% gain boost per 20 m/s²
 ```
 
 ## Running
@@ -159,7 +154,7 @@ HYBRID_ACCEL_GAIN_BOOST = 0.02 # 2% gain boost per 20 m/s²
 ### Full Stack with Hybrid Mode
 
 ```bash
-cd ~/Projects/digital-beacon
+cd ~/Documents/AlterMundi/Beacon/digital-beacon
 ./start.sh --hybrid --live    # Enable hybrid + live input
 ./start.sh --hybrid --file    # Enable hybrid + WAV file
 ```
@@ -170,12 +165,13 @@ cd ~/Projects/digital-beacon
 # Terminal 1: Hybrid bridge only
 python hybrid_bridge.py --target-host 127.0.0.1 --target-port 57120
 
-# Terminal 2: HR relay (Fitbit BLE)
+# Terminal 2: HR relay (Fitbit BLE) — sends straight to sclang, independent
+# of hybrid_bridge.py
 cd ../cymatic-control
 python hr_relay.py --mode ble --target digital-beacon --device "Charge 6"
 
-# Terminal 3: Phone IMU (curl test)
-curl -X POST http://localhost:8081/imu \
+# Terminal 3: Phone IMU (curl test, hits hybrid_bridge.py's Flask server)
+curl -X POST http://localhost:5051/imu \
   -H "Content-Type: application/json" \
   -d '{"yaw": 15, "pitch": -5, "roll": 0, "ax": 0.1, "ay": 0, "az": 9.8}'
 ```

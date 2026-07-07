@@ -2,10 +2,11 @@
 # start.sh — digital-beacon launcher
 #
 # Starts (in order):
-#   1. pw-jack scsynth           (audio server, 57110)
-#   2. sclang beacon.scd         (synth engine, 57120)
+#   1. scsynth                   (audio server, 57110; pw-jack wrapper on Linux)
+#   2. sclang beacon[_simple].scd (synth engine, 57120 — ATK auto-detected)
 #   3. f1_bridge.py              (forwards f1 -> vsrate)
-#   4. digital_beacon main       (Shaper: MIDI + OSC + audio)
+#   4. hybrid_bridge.py          (Fitbit HR + Phone IMU bridge, --hybrid only)
+#   5. digital_beacon main       (Shaper: MIDI + OSC + audio)
 #
 # Usage:
 #   ./start.sh --file             (WAV source — same as beacon-spatial)
@@ -60,23 +61,30 @@ else
   echo "Source: LIVE — SoundIn.ar(0) [R24 CH1]"
 fi
 
+# Portable "which PIDs hold this port" — works on both macOS (BSD lsof) and
+# Linux (util-linux lsof); avoids `ss`, which doesn't exist on macOS.
+pids_on_port() {
+  lsof -nP -iUDP:"$1" -iTCP:"$1" -t 2>/dev/null | sort -u
+}
+
 # ─── 0. Pre-kill: ensure ports are free ─────────────────────────────────────
 # If a previous session died badly, scsynth/sclang may still hold the ports.
 # Killing them up-front prevents "address in use" failures on restart.
 prekill() {
   echo ""
-  echo ">>> [0/4] Pre-kill: clearing zombies on 57110/57120/9001/9002 ..."
+  echo ">>> [0/4] Pre-kill: clearing zombies on 57110/57120/9001/9002/5051 ..."
   pkill -9 -f 'pw-jack scsynth'        2>/dev/null || true
-  pkill -9 -f 'sclang.*beacon.scd'     2>/dev/null || true
+  pkill -9 -f 'sclang.*beacon'          2>/dev/null || true
   pkill -9 -f 'sclang.*digital-beacon' 2>/dev/null || true
   pkill -9 -f 'f1_bridge'               2>/dev/null || true
+  pkill -9 -f 'hybrid_bridge'          2>/dev/null || true
   pkill -9 -f 'digital_beacon.main'    2>/dev/null || true
   sleep 1.0
   # Belt-and-suspenders: explicitly free any port still bound
   local freed=0
-  for port in 57110 57120 9001 9002 8081; do
+  for port in 57110 57120 9001 9002 5051; do
     local pids
-    pids=$(ss -ulnpH 2>/dev/null | awk -v p=":$port" '$0 ~ p' | grep -o 'pid=[0-9]*' | sed 's/pid=//' | sort -u)
+    pids=$(pids_on_port "$port")
     for pid in $pids; do
       if kill -0 "$pid" 2>/dev/null; then
         kill -9 "$pid" 2>/dev/null || true
@@ -122,7 +130,7 @@ for i in {1..20}; do
     cat /tmp/digital-beacon-scsynth.log 2>/dev/null | tail -10
     echo ""
     echo "Likely cause: port 57110 still in use. Pre-kill may have failed."
-    echo "Manual fix:   pkill -9 -f 'pw-jack scsynth'; sleep 2; ss -ulnp | grep 57110"
+    echo "Manual fix:   pkill -9 -f 'pw-jack scsynth'; sleep 2; lsof -nP -iUDP:57110"
     exit 1
   fi
   sleep 0.5
@@ -152,9 +160,24 @@ if [[ "$OSTYPE" != "darwin"* ]]; then
   fi
 fi
 
-# ─── 2. sclang (beacon.scd) ─────────────────────────────────────────────────
+# ─── 2. sclang (beacon.scd or beacon_simple.scd) ────────────────────────────
+# beacon.scd requires the ATK (Ambisonic Toolkit) quark for FoaPanB/FoaDecode/
+# FoaDecoderKernel. If it's not installed, sclang would fail to boot with
+# undefined-class errors. Detect it by looking for a core ATK class file
+# (FoaEncode.sc) anywhere under the user or system SuperCollider support dirs
+# — covers both Quarks-manager and manual Extensions installs — and fall back
+# to the ATK-free beacon_simple.scd when absent.
+SC_SCD="beacon.scd"
+if ! find "$HOME/Library/Application Support/SuperCollider" "/Library/Application Support/SuperCollider" \
+     -iname "FoaEncode.sc" -print -quit 2>/dev/null | grep -q .; then
+  SC_SCD="beacon_simple.scd"
+  echo "  ATK quark not found — falling back to $SC_SCD"
+else
+  echo "  ATK quark found — using $SC_SCD"
+fi
+
 echo ""
-echo ">>> [2/4] Starting sclang beacon.scd (PTY, :57120) ..."
+echo ">>> [2/4] Starting sclang $SC_SCD (PTY, :57120) ..."
 # sclang needs a TTY or it exits. We use Python's pty module to allocate a
 # pseudo-TTY and a reader thread to capture output unbuffered.
 # This is more robust than script(1) + FIFO, which has buffering issues with
@@ -168,8 +191,9 @@ pid, fd = pty.fork()
 if pid == 0:
     # Child: exec sclang
     os.environ['BEACON_SOURCE'] = '$BEACON_SOURCE'
-    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-    os.execvp('$SCLANG_BIN', ['$SCLANG_BIN', '-u', '57120', 'beacon.scd'])
+    os.environ['AUDIO_FILE'] = '$AUDIO_FILE'
+    os.environ['QT_QPA_PLATFORM'] = 'cocoa'
+    os.execvp('$SCLANG_BIN', ['$SCLANG_BIN', '-u', '57120', '$SC_SCD'])
 else:
     # Parent: read from pty, write to log
     def reader():
@@ -243,9 +267,9 @@ cleanup() {
   done
   sleep 0.5
   # Kill anything else still holding our ports (orphans, grandchildren)
-  for port in 57110 57120 9001 9002 8081; do
+  for port in 57110 57120 9001 9002 5051; do
     local pids
-    pids=$(ss -ulnpH 2>/dev/null | awk -v p=":$port" '$0 ~ p' | grep -o 'pid=[0-9]*' | sed 's/pid=//' | sort -u)
+    pids=$(pids_on_port "$port")
     for pid in $pids; do
       if kill -0 "$pid" 2>/dev/null; then
         kill -KILL "$pid" 2>/dev/null || true

@@ -177,7 +177,7 @@ Deberías ver algo como:
 ```
 2026-07-06 15:30:01 | INFO    | hybrid_bridge | ♥ beat #42  72 BPM  (RR: 833ms)
 2026-07-06 15:30:02 | INFO    | hybrid_bridge | ♥ beat #43  73 BPM  (RR: 821ms)
-2026-07-06 15:30:02 | DEBUG   | hybrid_bridge | /spatial/imu seq=128 yaw=15.0 pitch=-5.0 roll=0.0
+2026-07-06 15:30:02 | DEBUG   | hybrid_bridge | /hybrid/imu seq=128 yaw=15.0 pitch=-5.0 roll=0.0
 ```
 
 ### En el Mac — verificar estado vía API:

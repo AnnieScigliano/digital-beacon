@@ -38,7 +38,6 @@ OSC_HOST = "0.0.0.0"      # bind for listeners
 # ─── Hybrid Sensor Mode (v1.0) ───────────────────────────────────────────────
 # Fitbit HR + Phone IMU bridge configuration
 HYBRID_ENABLED = True
-HYBRID_OSC_PORT = 9003        # hybrid_bridge listens here (not 9001/9002)
 HYBRID_IMU_PORT = 5051        # HTTP endpoint for phone IMU data
 HYBRID_BPM_REF = 72.0         # reference BPM for sync
 HYBRID_CLOCK_INTERVAL = 1.0   # seconds between /sync/clock broadcasts
