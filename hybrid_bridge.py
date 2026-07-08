@@ -77,6 +77,92 @@ ACCEL_TO_GAIN_BOOST = 0.3               # accel magnitude → gain boost
 HR_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HR_CHAR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 
+# Phone IMU sender page (served at GET /) — fetch()es /imu relative to its own
+# origin, so tunneling this one port (cloudflared/ngrok) is enough: no mixed
+# HTTPS-page/HTTP-fetch content, and no IP to type in on the phone.
+IMU_SENDER_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Beacon IMU</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #0f0; padding: 20px; }
+    button { font-size: 18px; padding: 15px; margin: 10px 0; width: 100%; }
+    #status { font-size: 14px; margin-top: 20px; }
+    .value { font-family: monospace; font-size: 16px; }
+  </style>
+</head>
+<body>
+  <h2>Beacon IMU Sender</h2>
+  <button id="startBtn" onclick="start()">Start Sensors</button>
+  <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+  <div id="status">Status: idle</div>
+  <div id="data"></div>
+
+<script>
+let interval = null;
+const status = document.getElementById('status');
+const dataDiv = document.getElementById('data');
+
+async function start() {
+  if (typeof DeviceMotionEvent !== 'undefined' &&
+      typeof DeviceMotionEvent.requestPermission === 'function') {
+    // iOS 13+ requires an explicit user-gesture permission request.
+    const resp = await DeviceMotionEvent.requestPermission().catch(() => 'denied');
+    if (resp !== 'granted') {
+      status.textContent = 'Status: motion permission denied';
+      return;
+    }
+  }
+  window.addEventListener('deviceorientation', handleOrientation);
+  window.addEventListener('devicemotion', handleMotion);
+  interval = setInterval(sendData, 100); // 10 Hz
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('stopBtn').disabled = false;
+  status.textContent = 'Status: streaming @ 10Hz';
+}
+
+function stop() {
+  window.removeEventListener('deviceorientation', handleOrientation);
+  window.removeEventListener('devicemotion', handleMotion);
+  clearInterval(interval);
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+  status.textContent = 'Status: stopped';
+}
+
+let yaw = 0, pitch = 0, roll = 0, ax = 0, ay = 0, az = 9.8;
+
+function handleOrientation(e) {
+  yaw = e.alpha || 0;
+  pitch = e.beta || 0;
+  roll = e.gamma || 0;
+}
+
+function handleMotion(e) {
+  const a = e.acceleration || {};
+  ax = a.x || 0;
+  ay = a.y || 0;
+  az = a.z || 9.8;
+}
+
+function sendData() {
+  const payload = { yaw, pitch, roll, ax, ay, az };
+  fetch('/imu', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then(r => r.json())
+    .then(j => {
+      dataDiv.innerHTML = `<span class="value">Y:${yaw.toFixed(1)} P:${pitch.toFixed(1)} R:${roll.toFixed(1)} | A:${ax.toFixed(2)},${ay.toFixed(2)},${az.toFixed(2)}</span>`;
+    })
+    .catch(e => { status.textContent = 'Error: ' + e.message; });
+}
+</script>
+</body>
+</html>
+"""
+
 
 # ─── Data structures ───────────────────────────────────────────────────────
 
@@ -363,6 +449,18 @@ def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int):
 
     app = Flask(__name__)
 
+    @app.route("/", methods=["GET"])
+    def sender_page():
+        """Serve the phone IMU sender page from this same origin.
+
+        DeviceOrientation/DeviceMotion only work in a secure context (HTTPS)
+        on modern browsers. Tunnel this port (e.g. `cloudflared tunnel --url
+        http://localhost:5051`) and open the tunnel's HTTPS URL on the phone
+        — since the page and /imu are same-origin, the fetch() below never
+        crosses HTTPS->HTTP (which browsers block as mixed content).
+        """
+        return IMU_SENDER_HTML
+
     @app.route("/imu", methods=["POST"])
     def imu_endpoint():
         """Receive IMU data from phone browser sensors.
@@ -406,7 +504,8 @@ def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int):
             return jsonify({"ok": False, "error": str(e)}), 400
 
     log.info("IMU HTTP server on http://0.0.0.0:%d", port)
-    log.info("  POST /imu     — receive phone IMU data")
+    log.info("  GET  /              — phone sender page (tunnel this for HTTPS)")
+    log.info("  POST /imu           — receive phone IMU data")
     log.info("  GET  /hybrid/status — sensor state")
     log.info("  POST /hybrid/mode   — set mode (0=HR, 1=IMU, 2=Hybrid)")
     app.run(host="0.0.0.0", port=port, threaded=True, debug=False)

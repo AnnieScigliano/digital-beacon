@@ -76,7 +76,7 @@ Este camino manda directo a sclang, en paralelo a lo que ya genera
 
 ## Paso 4: Conectar el teléfono (IMU)
 
-### 4a. En el teléfono — opción simple (curl desde computadora en la misma red):
+### 4a. En el teléfono — curl de prueba (sin sensores reales, solo para probar el wiring):
 
 Si tu teléfono y el Mac están en la misma WiFi, podés probar desde la terminal del Mac:
 
@@ -87,97 +87,40 @@ curl -X POST http://192.168.1.XXX:5051/imu \
   -d '{"yaw": 45, "pitch": 10, "roll": 0, "ax": 0.1, "ay": 0, "az": 9.8}'
 ```
 
-### 4b. En el teléfono — opción web (HTML + JavaScript):
+### 4b. En el teléfono — sensores reales del teléfono (Android o iOS):
 
-Crear un archivo `imu_sender.html` en el teléfono o servirlo desde el Mac:
-
-```html
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Beacon IMU</title>
-  <style>
-    body { font-family: sans-serif; background: #111; color: #0f0; padding: 20px; }
-    button { font-size: 18px; padding: 15px; margin: 10px 0; width: 100%; }
-    #status { font-size: 14px; margin-top: 20px; }
-    .value { font-family: monospace; font-size: 16px; }
-  </style>
-</head>
-<body>
-  <h2>🔔 Beacon IMU Sender</h2>
-  <p>Server IP: <input type="text" id="ip" value="192.168.1.XXX" placeholder="Mac IP"></p>
-  <button id="startBtn" onclick="start()">Start Sensors</button>
-  <button id="stopBtn" onclick="stop()" disabled>Stop</button>
-  <div id="status">Status: idle</div>
-  <div id="data"></div>
-
-<script>
-let interval = null;
-const status = document.getElementById('status');
-const dataDiv = document.getElementById('data');
-
-function start() {
-  const ip = document.getElementById('ip').value;
-  window.addEventListener('deviceorientation', handleOrientation);
-  window.addEventListener('devicemotion', handleMotion);
-  interval = setInterval(() => sendData(ip), 100); // 10 Hz
-  document.getElementById('startBtn').disabled = true;
-  document.getElementById('stopBtn').disabled = false;
-  status.textContent = 'Status: streaming @ 10Hz';
-}
-
-function stop() {
-  window.removeEventListener('deviceorientation', handleOrientation);
-  window.removeEventListener('devicemotion', handleMotion);
-  clearInterval(interval);
-  document.getElementById('startBtn').disabled = false;
-  document.getElementById('stopBtn').disabled = true;
-  status.textContent = 'Status: stopped';
-}
-
-let yaw = 0, pitch = 0, roll = 0, ax = 0, ay = 0, az = 9.8;
-
-function handleOrientation(e) {
-  yaw = e.alpha || 0;
-  pitch = e.beta || 0;
-  roll = e.gamma || 0;
-}
-
-function handleMotion(e) {
-  const a = e.acceleration || {};
-  ax = a.x || 0;
-  ay = a.y || 0;
-  az = a.z || 9.8;
-}
-
-function sendData(ip) {
-  const payload = { yaw, pitch, roll, ax, ay, az };
-  fetch(`http://${ip}:5051/imu`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  }).then(r => r.json())
-    .then(j => {
-      dataDiv.innerHTML = `<span class="value">Y:${yaw.toFixed(1)} P:${pitch.toFixed(1)} R:${roll.toFixed(1)} | A:${ax.toFixed(2)},${ay.toFixed(2)},${az.toFixed(2)}</span>`;
-    })
-    .catch(e => { status.textContent = 'Error: ' + e.message; });
-}
-</script>
-</body>
-</html>
-```
-
-Servir desde el Mac:
+`DeviceOrientationEvent`/`DeviceMotionEvent` solo funcionan en un **contexto
+seguro (HTTPS)** en navegadores modernos — es una política de Chrome y
+Safari por igual, no algo específico de iOS. `hybrid_bridge.py` ya sirve la
+página del sensor en `GET /` (mismo origen que `POST /imu`, así que tunelear
+un solo puerto alcanza — sin problema de "mixed content"):
 
 ```bash
+# Terminal 1 (o ya corriendo vía ./start.sh --hybrid):
 cd ~/Documents/AlterMundi/Beacon/digital-beacon
-python3 -m http.server 8082
+./venv/bin/python3 hybrid_bridge.py --imu-port 5051
+
+# Terminal 2 — túnel HTTPS gratis, sin cuenta:
+brew install cloudflared   # una sola vez
+cloudflared tunnel --url http://localhost:5051
 ```
 
-Y en el teléfono abrí: `http://IP_DEL_MAC:8082/im_sender.html`
+`cloudflared` va a imprimir algo como:
 
-**IMPORTANTE:** En iOS, Safari requiere HTTPS para DeviceMotion. Usá ngrok o sirve desde localhost con tunnel.
+```
+Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):
+https://sandy-diet-ought-montgomery.trycloudflare.com
+```
+
+Abrí esa URL en el teléfono, apretá **Start Sensors** (en iOS te va a pedir
+permiso de movimiento — aceptalo), y listo — vas a ver yaw/pitch/roll/accel
+actualizándose en la página, y en el log de `hybrid_bridge.py` vas a ver
+`POST /imu` entrando.
+
+**Nota:** la URL de `trycloudflare.com` es efímera — cambia cada vez que
+reiniciás `cloudflared`. Para una URL fija hace falta una cuenta de
+Cloudflare y un túnel con nombre (ver [docs de Cloudflare
+Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps)).
 
 ## Paso 5: Verificar que todo funciona
 
