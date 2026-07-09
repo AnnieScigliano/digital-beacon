@@ -454,6 +454,43 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
         sc_osc.send_message("/hybrid/hr", [bpm, rr_ms, confidence])
         return {"ok": True, "hr": {"bpm": bpm, "rr_ms": rr_ms}}
 
+    @app.post("/api/hybrid/hr/sync")
+    async def sync_hybrid_hr(body: dict):
+        """Mirror HR into the dashboard's live state only — no OSC forward.
+
+        For hybrid_bridge.py, which already sent this same reading straight
+        to sclang via OSC itself; without this the dashboard's Hybrid
+        Sensors panel never reflects hybrid_bridge.py's own BLE/simulate
+        capture (only values that came in through /api/hybrid/hr directly).
+        """
+        try:
+            bpm = float(body.get("bpm", 0.0))
+            rr_ms = float(body.get("rr_ms", 0.0))
+            confidence = float(body.get("confidence", 1.0))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, f"invalid hr data: {e}")
+        store.update_hybrid_hr(bpm, rr_ms, confidence)
+        return {"ok": True}
+
+    @app.post("/api/hybrid/imu/sync")
+    async def sync_hybrid_imu(body: dict):
+        """Mirror IMU into the dashboard's live state only — no OSC forward.
+
+        Same rationale as /api/hybrid/hr/sync, for hybrid_bridge.py's own
+        /imu endpoint (phone data arriving via the cloudflared tunnel).
+        """
+        try:
+            yaw = float(body.get("yaw", 0.0))
+            pitch = float(body.get("pitch", 0.0))
+            roll = float(body.get("roll", 0.0))
+            ax = float(body.get("ax", 0.0))
+            ay = float(body.get("ay", 0.0))
+            az = float(body.get("az", 0.0))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, f"invalid imu data: {e}")
+        store.update_hybrid_imu(yaw, pitch, roll, ax, ay, az)
+        return {"ok": True}
+
     # ─── REST: Recording (pw-record on PipeWire monitor) ────────────────
     @app.get("/api/record/status")
     async def record_status():

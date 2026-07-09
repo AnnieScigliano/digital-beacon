@@ -38,6 +38,8 @@ import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -66,6 +68,7 @@ log = logging.getLogger("hybrid_bridge")
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 DEFAULT_IMU_HTTP_PORT = 5051            # phone IMU posts here
+DEFAULT_DASHBOARD_PORT = 8080            # digital_beacon.main's dashboard (0 disables sync)
 DEFAULT_BPM_REF = 72.0                  # reference BPM for sync
 HR_TO_GAIN_DEPTH = 0.15                 # max ±gain modulation from HR
 HR_TO_SHAPE_DEPTH = 0.25                # max shape modulation from HR
@@ -291,6 +294,33 @@ class HybridOSCProtocol:
         self.send_imu(yaw, pitch, roll, ax, ay, az)
 
 
+def sync_dashboard(path: str, payload: dict, host: str, port: int) -> None:
+    """Best-effort mirror of a sensor update into digital_beacon's dashboard.
+
+    This bridge sends HR/IMU straight to sclang via OSC (see HybridOSCProtocol
+    above) — that's the audio-critical path and doesn't touch this at all.
+    But digital_beacon.main's web dashboard (:8080) only knows about sensor
+    values that went through its own /api/hybrid/* endpoints, so without this
+    the dashboard's "Hybrid Sensors" panel stays at zero no matter what this
+    bridge is doing. The /sync variants below update the dashboard's state
+    only — they don't re-forward to sclang, since that already happened.
+    Failures (dashboard not running, etc.) are swallowed — this is a nice-to-
+    have status mirror, not required for the audio path to work.
+    """
+    if port <= 0:
+        return
+    try:
+        req = urllib.request.Request(
+            f"http://{host}:{port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=0.5).close()
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        log.debug("Dashboard sync %s failed: %s", path, e)
+
+
 # ─── BLE Heart Rate ────────────────────────────────────────────────────────
 
 def parse_hr_measurement(data: bytearray) -> tuple[int, list[float]]:
@@ -372,12 +402,16 @@ async def run_ble_async(state: SensorState, protocol: HybridOSCProtocol, args):
             for rr_ms in rr_intervals:
                 state.update_hr(bpm, rr_ms)
                 protocol.send_heartbeat(bpm, rr_ms)
+                sync_dashboard("/api/hybrid/hr/sync", {"bpm": bpm, "rr_ms": rr_ms, "confidence": 1.0},
+                               args.dashboard_host, args.dashboard_port)
                 beat_count += 1
                 log.info("♥ beat #%d  %d BPM  (RR: %.0fms)", beat_count, bpm, rr_ms)
         else:
             rr_ms = 60000.0 / max(bpm, 1)
             state.update_hr(bpm, rr_ms)
             protocol.send_heartbeat(bpm, rr_ms)
+            sync_dashboard("/api/hybrid/hr/sync", {"bpm": bpm, "rr_ms": rr_ms, "confidence": 1.0},
+                           args.dashboard_host, args.dashboard_port)
             beat_count += 1
             log.info("♥ beat #%d  %d BPM", beat_count, bpm)
 
@@ -425,6 +459,8 @@ def run_simulate(state: SensorState, protocol: HybridOSCProtocol, args):
 
             state.update_hr(current_bpm, rr_ms)
             protocol.send_heartbeat(current_bpm, rr_ms)
+            sync_dashboard("/api/hybrid/hr/sync", {"bpm": current_bpm, "rr_ms": rr_ms, "confidence": 1.0},
+                           args.dashboard_host, args.dashboard_port)
             beat_count += 1
 
             bar = "♥" if beat_count % 2 == 0 else "♡"
@@ -439,7 +475,8 @@ def run_simulate(state: SensorState, protocol: HybridOSCProtocol, args):
 
 # ─── IMU HTTP Server (Flask) ───────────────────────────────────────────────
 
-def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int):
+def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int,
+                    dashboard_host: str = "127.0.0.1", dashboard_port: int = DEFAULT_DASHBOARD_PORT):
     """Start a lightweight HTTP server to receive phone IMU data."""
     try:
         from flask import Flask, request, jsonify
@@ -480,6 +517,9 @@ def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int):
 
             state.update_imu(yaw, pitch, roll, ax, ay, az)
             protocol.send_imu(yaw, pitch, roll, ax, ay, az)
+            sync_dashboard("/api/hybrid/imu/sync",
+                           {"yaw": yaw, "pitch": pitch, "roll": roll, "ax": ax, "ay": ay, "az": az},
+                           dashboard_host, dashboard_port)
 
             return jsonify({"ok": True, "seq": state.seq})
         except Exception as e:
@@ -543,6 +583,12 @@ def main():
                         help="Target OSC port (default: 57120)")
     parser.add_argument("--clock-interval", type=float, default=1.0,
                         help="Sync clock broadcast interval in seconds (default: 1.0)")
+    parser.add_argument("--dashboard-host", default="127.0.0.1",
+                        help="digital_beacon dashboard host, for mirroring live sensor "
+                             "values into its web UI (default: 127.0.0.1)")
+    parser.add_argument("--dashboard-port", type=int, default=DEFAULT_DASHBOARD_PORT,
+                        help=f"digital_beacon dashboard port (default: {DEFAULT_DASHBOARD_PORT}); "
+                             "0 disables the mirror")
     args = parser.parse_args()
 
     # State + Protocol
@@ -565,8 +611,10 @@ def main():
     clock_t.start()
 
     # Start IMU HTTP server thread
-    imu_t = threading.Thread(target=run_imu_server, args=(state, protocol, args.imu_port),
-                             name="hybrid-imu", daemon=True)
+    imu_t = threading.Thread(
+        target=run_imu_server,
+        args=(state, protocol, args.imu_port, args.dashboard_host, args.dashboard_port),
+        name="hybrid-imu", daemon=True)
     imu_t.start()
 
     # Start HR mode
