@@ -167,6 +167,37 @@
         </div>
     </div>
 
+    <!-- Hybrid Sensors: raw HR/IMU + the deltas they're inducing in the sound -->
+    <div class="mix-section" id="hybrid-panel">
+        <div style="font-size:0.6rem;color:#888;text-transform:uppercase;margin-bottom:6px;">
+            Hybrid Sensors <span id="hybrid-stale" style="color:#e74c3c;"></span>
+        </div>
+        <div class="mix-grid">
+            <div class="mix-param"><label class="sl" style="color:#e74c3c;">BPM</label>
+                <div class="val" id="hy-bpm">0.0</div></div>
+            <div class="mix-param"><label class="sl" style="color:#e74c3c;">RR ms</label>
+                <div class="val" id="hy-rr">0.0</div></div>
+            <div class="mix-param"><label class="sl" style="color:#e74c3c;">Confidence</label>
+                <div class="val" id="hy-conf">0.00</div></div>
+            <div class="mix-param"><label class="sl" style="color:#3498db;">Yaw°</label>
+                <div class="val" id="hy-yaw">0.0</div></div>
+            <div class="mix-param"><label class="sl" style="color:#3498db;">Pitch°</label>
+                <div class="val" id="hy-pitch">0.0</div></div>
+            <div class="mix-param"><label class="sl" style="color:#3498db;">Accel</label>
+                <div class="val" id="hy-accel">0.0</div></div>
+        </div>
+        <div class="mix-grid" style="margin-top:6px;">
+            <div class="mix-param"><label class="sl" style="color:#e74c3c;">Gain pulse</label>
+                <div class="val" id="hy-pulse">±0.0%</div></div>
+            <div class="mix-param"><label class="sl" style="color:#e74c3c;">Shape mod</label>
+                <div class="val" id="hy-shape">±0.0%</div></div>
+            <div class="mix-param"><label class="sl" style="color:#3498db;">Pan mod</label>
+                <div class="val" id="hy-pan">0.00</div></div>
+            <div class="mix-param"><label class="sl" style="color:#3498db;">Accel boost</label>
+                <div class="val" id="hy-boost">0.0%</div></div>
+        </div>
+    </div>
+
     <div class="grid" id="grid"></div>
 
     <!-- Presets -->
@@ -299,7 +330,48 @@ function applyShaperState(s) {
   gu('lfo-amount',s.lfo_amount); showVal('vlfoa',(s.lfo_amount||0).toFixed(2));
   gu('lfo-div',s.lfo_rate_divisor); showVal('vlfod',s.lfo_rate_divisor||1);
   document.getElementById('lfo-wav').value=s.lfo_waveform||'sine';
+  applyHybridState(s.hybrid);
 }
+
+// Hybrid Sensors panel: raw values + the deltas they induce, mirroring the
+// exact formulas in beacon_simple.scd/beacon.scd's \hybrid_hr/\hybrid_imu
+// OSCdefs, purely for display (does not send anything).
+let lastHybridSnapshot = null;
+let lastHybridChangeAt = Date.now();
+function applyHybridState(h) {
+  h = h || {};
+  const bpm = h.bpm || 0, rr = h.rr_ms || 0, conf = h.confidence || 0;
+  const yaw = h.yaw || 0, pitch = h.pitch || 0;
+  const ax = h.ax || 0, ay = h.ay || 0, az = h.az || 9.8;
+  const accelMag = Math.sqrt(ax*ax + ay*ay + az*az);
+
+  const bpmNorm = Math.max(-1, Math.min(1, (bpm - 72) / 30));
+  const pulse = bpm > 0 ? bpmNorm * 0.30 : 0;   // matches hr_pulse
+  const shape = bpm > 0 ? bpmNorm * 0.45 : 0;   // matches hr_shape
+  const yawNorm = Math.max(-1, Math.min(1, yaw / 180));
+  const panMod = (Math.abs(yaw) > 0.01 || Math.abs(pitch) > 0.01) ? yawNorm * 0.3 : 0;
+  const boost = Math.min(accelMag / 20, 1) * 0.35;  // matches accel_boost
+
+  document.getElementById('hy-bpm').textContent = bpm.toFixed(1);
+  document.getElementById('hy-rr').textContent = rr.toFixed(0);
+  document.getElementById('hy-conf').textContent = conf.toFixed(2);
+  document.getElementById('hy-yaw').textContent = yaw.toFixed(1);
+  document.getElementById('hy-pitch').textContent = pitch.toFixed(1);
+  document.getElementById('hy-accel').textContent = accelMag.toFixed(1);
+  document.getElementById('hy-pulse').textContent = (pulse >= 0 ? '+' : '') + (pulse*100).toFixed(1) + '%';
+  document.getElementById('hy-shape').textContent = (shape >= 0 ? '+' : '') + (shape*100).toFixed(1) + '%';
+  document.getElementById('hy-pan').textContent = panMod.toFixed(2);
+  document.getElementById('hy-boost').textContent = '+' + (boost*100).toFixed(1) + '%';
+
+  // Staleness: flag if nothing has actually changed value in a while — a
+  // frozen sensor (dropped BLE/tunnel) still looks "live" otherwise.
+  const snapshot = JSON.stringify([bpm, rr, conf, yaw, pitch, ax, ay, az]);
+  if (snapshot !== lastHybridSnapshot) { lastHybridSnapshot = snapshot; lastHybridChangeAt = Date.now(); }
+}
+setInterval(() => {
+  const stale = (Date.now() - lastHybridChangeAt) > 5000;
+  document.getElementById('hybrid-stale').textContent = stale ? '(stale — no updates in 5s+)' : '';
+}, 1000);
 
 function applyScState() {
   for (let n=1;n<=N;n++) {

@@ -43,11 +43,11 @@ HYBRID_BPM_REF = 72.0         # reference BPM for sync
 HYBRID_CLOCK_INTERVAL = 1.0   # seconds between /sync/clock broadcasts
 
 # Sensor → audio mapping depths (0..1 scale)
-HYBRID_HR_GAIN_DEPTH = 0.15   # max ±gain modulation from HR
-HYBRID_HR_SHAPE_DEPTH = 0.25  # max shape modulation from HR
+HYBRID_HR_GAIN_DEPTH = 0.30   # max ±gain modulation from HR
+HYBRID_HR_SHAPE_DEPTH = 0.45  # max shape modulation from HR
 HYBRID_YAW_AZ_RANGE = 90.0    # yaw ±180° → azimuth ±90°
 HYBRID_PITCH_DIST_RANGE = 5.0 # pitch ±90° → distance ±5
-HYBRID_ACCEL_GAIN_BOOST = 0.3  # accel magnitude → gain boost
+HYBRID_ACCEL_GAIN_BOOST = 0.35  # accel magnitude → gain boost
 
 # ─── Beacon-spatial legacy port (older /beacon/* messages) ──────────────────
 # digital-beacon ALSO listens on the legacy 9001 broadcast port.

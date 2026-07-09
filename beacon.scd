@@ -288,8 +288,8 @@ server.doWhenBooted({
     var rr_ms = msg[2].asFloat;
     var confidence = msg[3].asFloat;
     var bpm_norm = ((bpm - 72) / 30).clip(-1.0, 1.0);
-    var hr_pulse = bpm_norm * 0.05;  // ±5% master gain
-    var hr_shape = bpm_norm * 0.15;  // ±15% shape modulation
+    var hr_pulse = bpm_norm * 0.30;  // ±30% master gain
+    var hr_shape = bpm_norm * 0.45;  // ±45% shape modulation
     var current_master, band_shift;
 
     // Apply master gain pulse
@@ -300,13 +300,13 @@ server.doWhenBooted({
     nBands.do { |i|
       var n = i + 1;
       var current_gain = defaultGains[i];
-      // Subtle brightness shift: higher BPM → slightly higher gain on upper bands
-      band_shift = if (i > 15) { hr_shape * 0.3 } { 0 };
+      // Brightness shift: higher BPM → higher gain on upper bands
+      band_shift = if (i > 15) { hr_shape } { 0 };
       synth.set(("gain" ++ n).asSymbol, (current_gain + band_shift).clip(0.0, 3.0));
     };
 
     "  [HYBRID HR] BPM=%  RR=%ms  conf=%  pulse=%  shape=%".format(
-      bpm.round(0.1), rr_ms.round(0.1), confidence.round(2), hr_pulse.round(3), hr_shape.round(3)
+      bpm.round(0.1), rr_ms.round(0.1), confidence.round(0.01), hr_pulse.round(0.001), hr_shape.round(0.001)
     ).postln;
   }, "/hybrid/hr"));
 
@@ -333,7 +333,7 @@ server.doWhenBooted({
 
     // Pitch → subtle elevation: tilt forward (pitch > 0) → boost front bands
     // We approximate by modulating gain on bands with az near 0°
-    pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.2;
+    pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.4;
     nBands.do { |i|
       var n = i + 1;
       var base_az = defaultAz[i];
@@ -344,13 +344,13 @@ server.doWhenBooted({
       };
     };
 
-    // Acceleration magnitude → subtle global brightness
+    // Acceleration magnitude → global brightness
     accel_mag = (ax.squared + ay.squared + az.squared).sqrt;
-    accel_boost = (accel_mag / 20).clip(0, 1) * 0.1;
+    accel_boost = (accel_mag / 20).clip(0, 1) * 0.35;
     synth.set(\master, (master0 * (1.0 + accel_boost)).clip(0.0, 3.0));
 
     "  [HYBRID IMU] yaw=%°  pitch=%°  roll=%°  accel=%  boost=%".format(
-      yaw.round(0.1), pitch.round(0.1), roll.round(0.1), accel_mag.round(1), accel_boost.round(3)
+      yaw.round(0.1), pitch.round(0.1), roll.round(0.1), accel_mag.round(0.1), accel_boost.round(0.001)
     ).postln;
   }, "/hybrid/imu"));
 

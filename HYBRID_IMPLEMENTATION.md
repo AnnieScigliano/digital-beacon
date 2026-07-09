@@ -144,9 +144,9 @@ All hybrid settings are in `digital_beacon/config.py`:
 HYBRID_ENABLED = True
 HYBRID_IMU_PORT = 5051         # HTTP server for phone IMU (hybrid_bridge.py)
 HYBRID_BPM_REF = 72.0          # Reference BPM for normalization
-HYBRID_HR_GAIN_DEPTH = 0.15    # ±15% master gain at ±30 BPM
-HYBRID_HR_SHAPE_DEPTH = 0.25   # ±25% shape modulation at ±30 BPM
-HYBRID_ACCEL_GAIN_BOOST = 0.3  # 30% gain boost per 20 m/s²
+HYBRID_HR_GAIN_DEPTH = 0.30    # ±30% master gain at ±30 BPM
+HYBRID_HR_SHAPE_DEPTH = 0.45   # ±45% shape modulation at ±30 BPM
+HYBRID_ACCEL_GAIN_BOOST = 0.35 # 35% gain boost per 20 m/s²
 ```
 
 ## Running
