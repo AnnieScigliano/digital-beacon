@@ -296,6 +296,14 @@ function applyShaperState(s) {
   document.getElementById('f1-val').textContent=(s.f1||40).toFixed(1);
   document.getElementById('strum-val').textContent=(s.strum_period_s||0.5).toFixed(2);
   document.getElementById('vbeacon-lvl').textContent=(s.beacon_level||0).toFixed(2);
+  // Update a slider from state (if not focused) — declared once here, not
+  // per-loop-iteration, since gu() below needs it too and a per-iteration
+  // `const` inside the for-block goes out of scope as soon as the loop ends
+  // (was throwing "upd is not defined" on every single WS message, which
+  // silently aborted the rest of this function via the try/catch in
+  // ws.onmessage — including every downstream consumer, like the Hybrid
+  // Sensors panel, that runs after the global-controls section below).
+  const upd=(id,val)=>{const e=document.getElementById(id);if(e&&document.activeElement!==e)e.value=val;};
   let active=0;
   for (let n=1;n<=N;n++) {
     const v=s.voices[String(n)]||{};
@@ -303,8 +311,6 @@ function applyShaperState(s) {
     const card=cards[n-1];
     card.querySelector('[data-role="led"]').classList.toggle('on',!!v.active);
 
-    // Update sliders from state (if not focused)
-    const upd=(id,val)=>{const e=document.getElementById(id);if(e&&document.activeElement!==e)e.value=val;};
     upd('sg'+n,v.gain!==undefined?v.gain:0.6); showVal('sgv'+n,(v.gain!==undefined?v.gain:0.6).toFixed(2));
     upd('sp'+n,v.pan!==undefined?v.pan:0); showVal('spv'+n,(v.pan!==undefined?v.pan:0).toFixed(2));
     upd('sph'+n,v.phase_deg!==undefined?v.phase_deg:0); showVal('sphv'+n,(v.phase_deg!==undefined?v.phase_deg:0)+'\u00B0');
