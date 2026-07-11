@@ -45,9 +45,64 @@ HYBRID_CLOCK_INTERVAL = 1.0   # seconds between /sync/clock broadcasts
 # Sensor → audio mapping depths (0..1 scale)
 HYBRID_HR_GAIN_DEPTH = 0.30   # max ±gain modulation from HR
 HYBRID_HR_SHAPE_DEPTH = 0.45  # max shape modulation from HR
-HYBRID_YAW_AZ_RANGE = 90.0    # yaw ±180° → azimuth ±90°
-HYBRID_PITCH_DIST_RANGE = 5.0 # pitch ±90° → distance ±5
-HYBRID_ACCEL_GAIN_BOOST = 0.35  # accel magnitude → gain boost
+HYBRID_ACCEL_GAIN_BOOST = 0.35  # accel magnitude → gain boost (legacy single-device path)
+# (HYBRID_YAW_AZ_RANGE/HYBRID_PITCH_DIST_RANGE were removed — they were
+# declared but never actually read by any mapping code, before or after
+# Phase 2; SC always used its own hardcoded 90/0.4 literals directly.)
+
+# ─── Hybrid Pair Mode (two-phone hug/dance MVP, Phase 2) ────────────────────
+# Splits the 32 harmonics into per-person registers plus a shared "bloom"
+# band, so each dancer's own motion is audibly theirs instead of the whole
+# field moving together. OPT-IN and OFF by default — the single-device
+# Hybrid mode used by everything built before this (whole-field yaw
+# rotation + HR gain/shape) is completely unaffected unless this is flipped
+# on. When it IS on, HR is intentionally excluded from the mapping
+# entirely, even if HR data happens to be running — this mode is scoped to
+# phone movement only (no heart-rate hardware assumed or simulated).
+HYBRID_PAIR_MODE_ENABLED = True
+
+HYBRID_HARMONICS_A = range(1, 11)        # 1-10: device "A"'s register
+HYBRID_HARMONICS_B = range(11, 21)       # 11-20: device "B"'s register
+HYBRID_HARMONICS_SHARED = range(21, 29)  # 21-28: synchrony-gated shared bloom
+# 29-32 are intentionally left out of hybrid mapping — plain manual/default
+# harmonics, not touched by any sensor.
+
+# Reference accel-magnitude "energy" (m/s^2) treated as full-scale (1.0) when
+# normalizing sway energy / pair energy into a 0..1 modulation range. This is
+# a GUESS pending real slow-dance-motion calibration (see the hug/dance
+# roadmap's Phase 5) — the existing single-device HYBRID_ACCEL_GAIN_BOOST
+# above was tuned around a different (more vigorous) motion profile and
+# should not be assumed to carry over.
+HYBRID_PAIR_ENERGY_REF = 3.0
+
+# Per-person: how much of A's/B's own register gain is a stronger perceived
+# presence (0.5 = up to +50% gain in their register at 100% of their sway).
+HYBRID_PAIR_SWAY_GAIN_DEPTH = 0.5
+# Per-person: forward lean (pitch) tilts their own register's gain, ± this much.
+HYBRID_PAIR_LEAN_GAIN_DEPTH = 0.2
+# Per-person: zeroed yaw ± this many pan units (-1..1) offsets their own
+# register's stereo position — spin, and their register audibly rotates.
+HYBRID_PAIR_YAW_PAN_RANGE = 0.6
+
+# Partner cross-bleed: a fraction of your partner's OWN gain modulation
+# (their sway/lean — not yours) that also shows up in your own register's
+# gain, scaled by current pair synchrony (0 at no sync, this fraction at
+# perfect sync). Deliberately gain-only, never pan — your register's
+# stereo position should stay legibly "yours" even as its presence starts
+# to carry a trace of the other person. At full sync your voice gets
+# roughly this fraction of your partner's self-driven gain swing layered
+# in on top of your own — meant to read as "I can feel them," clearly
+# secondary to your own motion, not as loud as it.
+HYBRID_PAIR_CROSS_BLEED_DEPTH = 0.35
+
+# Shared/bloom band: gain is gated directly by pair synchrony (0=silent,
+# 1=full base gain) — it only emerges when the couple is moving together.
+# (No depth constant needed: synchrony is already 0..1.)
+
+# Pair energy → master gain "breathing" pulse (echoes the HR pulse pattern
+# above, driven by combined body motion instead of a heart strap — this MVP
+# doesn't assume either dancer wears one).
+HYBRID_PAIR_ENERGY_GAIN_DEPTH = 0.25
 
 # ─── Beacon-spatial legacy port (older /beacon/* messages) ──────────────────
 # digital-beacon ALSO listens on the legacy 9001 broadcast port.

@@ -8,9 +8,18 @@ Combines:
 
 Protocol OSC (addresses/arg shapes match the OSCdefs registered in beacon.scd):
   /hybrid/sync/clock [timestamp, seq, bpm_ref]          — sync heartbeat
-  /hybrid/hr         [bpm, rr_ms, confidence]           — HR data
-  /hybrid/imu        [yaw, pitch, roll, ax, ay, az]      — IMU frame
-  /hybrid/mode       [mode]                             — 0=HR, 1=IMU, 2=Hybrid
+  /hybrid/hr         [bpm, rr_ms, confidence]           — HR data, device "A" (legacy address)
+  /hybrid/hr/<dev>   [bpm, rr_ms, confidence]           — HR data, any other device
+  /hybrid/imu        [yaw, pitch, roll, ax, ay, az]      — IMU frame, device "A" (legacy address)
+  /hybrid/imu/<dev>  [yaw, pitch, roll, ax, ay, az]      — IMU frame, any other device
+  /hybrid/mode       [mode]                             — 0=HR, 1=IMU, 2=Hybrid (global, not per-device)
+
+Multi-device: the phone sender page lets the wearer pick "Phone A" or
+"Phone B" before starting; that tag rides along in the /imu POST body and
+is used both to key server-side state (SensorState per device, in
+HybridSensorHub below) and to pick the OSC address above. Device "A" is
+the default everywhere, so single-phone setups behave exactly as before
+multi-device support existed.
 
 Creative mappings (enforced by beacon.scd + Shaper):
   HR (bpm)    → subtle master gain pulse + Shaper shape modulation + breathing LFO
@@ -93,19 +102,38 @@ IMU_SENDER_HTML = """<!DOCTYPE html>
     button { font-size: 18px; padding: 15px; margin: 10px 0; width: 100%; }
     #status { font-size: 14px; margin-top: 20px; }
     .value { font-family: monospace; font-size: 16px; }
+    #deviceLabel { font-size: 16px; margin-bottom: 10px; color: #0ff; }
   </style>
 </head>
 <body>
   <h2>Beacon IMU Sender</h2>
-  <button id="startBtn" onclick="start()">Start Sensors</button>
-  <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+  <div id="devicePicker">
+    <p>Which phone is this?</p>
+    <button onclick="pickDevice('A')">Phone A</button>
+    <button onclick="pickDevice('B')">Phone B</button>
+  </div>
+  <div id="controls" style="display:none;">
+    <div id="deviceLabel"></div>
+    <button id="startBtn" onclick="start()">Start Sensors</button>
+    <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+    <button id="recalBtn" onclick="recalibrate()" disabled>Recalibrate (face partner, stand still)</button>
+  </div>
   <div id="status">Status: idle</div>
   <div id="data"></div>
 
 <script>
+let device = new URLSearchParams(location.search).get('device');
 let interval = null;
 const status = document.getElementById('status');
 const dataDiv = document.getElementById('data');
+
+function pickDevice(d) {
+  device = d;
+  document.getElementById('devicePicker').style.display = 'none';
+  document.getElementById('controls').style.display = 'block';
+  document.getElementById('deviceLabel').textContent = 'Phone ' + device;
+}
+if (device) { pickDevice(device); }
 
 async function start() {
   if (typeof DeviceMotionEvent !== 'undefined' &&
@@ -122,7 +150,8 @@ async function start() {
   interval = setInterval(sendData, 100); // 10 Hz
   document.getElementById('startBtn').disabled = true;
   document.getElementById('stopBtn').disabled = false;
-  status.textContent = 'Status: streaming @ 10Hz';
+  document.getElementById('recalBtn').disabled = false;
+  status.textContent = 'Status: streaming @ 10Hz (calibrating on first reading)';
 }
 
 function stop() {
@@ -131,14 +160,35 @@ function stop() {
   clearInterval(interval);
   document.getElementById('startBtn').disabled = false;
   document.getElementById('stopBtn').disabled = true;
+  document.getElementById('recalBtn').disabled = true;
   status.textContent = 'Status: stopped';
+}
+
+// Yaw/pitch are reported relative to wherever the wearer was facing/tilted
+// at calibration time (first reading after Start, or after Recalibrate) —
+// not raw compass heading, which drifts and is noisy indoors. Recalibrating
+// mid-session (e.g. "now stand facing your partner") just re-zeros both.
+let yawZero = null, pitchZero = null;
+function wrap180(deg) {
+  let d = deg % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+function recalibrate() {
+  yawZero = null;
+  pitchZero = null;
+  status.textContent = 'Status: recalibrating on next reading...';
 }
 
 let yaw = 0, pitch = 0, roll = 0, ax = 0, ay = 0, az = 9.8;
 
 function handleOrientation(e) {
-  yaw = e.alpha || 0;
-  pitch = e.beta || 0;
+  const rawYaw = e.alpha || 0;
+  const rawPitch = e.beta || 0;
+  if (yawZero === null) { yawZero = rawYaw; pitchZero = rawPitch; }
+  yaw = wrap180(rawYaw - yawZero);
+  pitch = rawPitch - pitchZero;
   roll = e.gamma || 0;
 }
 
@@ -150,14 +200,14 @@ function handleMotion(e) {
 }
 
 function sendData() {
-  const payload = { yaw, pitch, roll, ax, ay, az };
+  const payload = { device, yaw, pitch, roll, ax, ay, az };
   fetch('/imu', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   }).then(r => r.json())
     .then(j => {
-      dataDiv.innerHTML = `<span class="value">Y:${yaw.toFixed(1)} P:${pitch.toFixed(1)} R:${roll.toFixed(1)} | A:${ax.toFixed(2)},${ay.toFixed(2)},${az.toFixed(2)}</span>`;
+      dataDiv.innerHTML = `<span class="value">[${device}] Y:${yaw.toFixed(1)} P:${pitch.toFixed(1)} R:${roll.toFixed(1)} | A:${ax.toFixed(2)},${ay.toFixed(2)},${az.toFixed(2)}</span>`;
     })
     .catch(e => { status.textContent = 'Error: ' + e.message; });
 }
@@ -239,6 +289,33 @@ class SensorState:
             }
 
 
+class HybridSensorHub:
+    """Holds one SensorState per connected device (e.g. "A", "B").
+
+    HR (BLE/simulate) always addresses device "A" — this bridge only talks
+    to one heart-rate strap at a time. IMU is where multi-device matters:
+    each phone tags its POSTs with a device id and gets its own SensorState.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._devices: dict[str, SensorState] = {}
+        self.mode: int = 0  # 0=HR, 1=IMU, 2=Hybrid — global, not per-device
+
+    def get(self, device: str) -> SensorState:
+        with self._lock:
+            if device not in self._devices:
+                self._devices[device] = SensorState()
+            return self._devices[device]
+
+    def to_dict(self) -> dict:
+        with self._lock:
+            return {
+                "mode": self.mode,
+                "devices": {dev: state.to_dict() for dev, state in self._devices.items()},
+            }
+
+
 # ─── OSC Protocol ──────────────────────────────────────────────────────────
 
 class HybridOSCProtocol:
@@ -268,18 +345,25 @@ class HybridOSCProtocol:
         self._client.send_message("/hybrid/sync/clock", [ts, seq, bpm_ref])
         log.debug("/hybrid/sync/clock seq=%d bpm_ref=%.1f", seq, bpm_ref)
 
-    def send_heartbeat(self, bpm: float, rr_ms: float, confidence: float = 1.0):
-        """Send heart rate data. Address/arg shape matches beacon.scd's \\hybrid_hr OSCdef."""
+    def send_heartbeat(self, bpm: float, rr_ms: float, confidence: float = 1.0,
+                       device: str = "A"):
+        """Send heart rate data. Device "A" uses the legacy bare address
+        (matches beacon.scd's \\hybrid_hr OSCdef); any other device gets
+        /hybrid/hr/<device>."""
         seq = self._next_seq()
-        self._client.send_message("/hybrid/hr", [bpm, rr_ms, confidence])
-        log.debug("/hybrid/hr seq=%d bpm=%.1f rr=%.0fms", seq, bpm, rr_ms)
+        addr = "/hybrid/hr" if device == "A" else f"/hybrid/hr/{device}"
+        self._client.send_message(addr, [bpm, rr_ms, confidence])
+        log.debug("%s seq=%d bpm=%.1f rr=%.0fms", addr, seq, bpm, rr_ms)
 
     def send_imu(self, yaw: float, pitch: float, roll: float,
-                 ax: float, ay: float, az: float):
-        """Send IMU frame. Address/arg shape matches beacon.scd's \\hybrid_imu OSCdef."""
+                 ax: float, ay: float, az: float, device: str = "A"):
+        """Send IMU frame. Device "A" uses the legacy bare address (matches
+        beacon.scd's \\hybrid_imu OSCdef); any other device gets
+        /hybrid/imu/<device>."""
         seq = self._next_seq()
-        self._client.send_message("/hybrid/imu", [yaw, pitch, roll, ax, ay, az])
-        log.debug("/hybrid/imu seq=%d yaw=%.1f pitch=%.1f roll=%.1f", seq, yaw, pitch, roll)
+        addr = "/hybrid/imu" if device == "A" else f"/hybrid/imu/{device}"
+        self._client.send_message(addr, [yaw, pitch, roll, ax, ay, az])
+        log.debug("%s seq=%d yaw=%.1f pitch=%.1f roll=%.1f", addr, seq, yaw, pitch, roll)
 
     def send_mode(self, mode: int):
         """Announce hybrid mode change. Arg shape matches beacon.scd's \\hybrid_mode OSCdef."""
@@ -289,9 +373,9 @@ class HybridOSCProtocol:
                  ["HR", "IMU", "Hybrid"][mode])
 
     def send_imu_bundle(self, yaw: float, pitch: float, roll: float,
-                        ax: float, ay: float, az: float):
+                        ax: float, ay: float, az: float, device: str = "A"):
         """Send IMU as OSC bundle (placeholder for future optimization)."""
-        self.send_imu(yaw, pitch, roll, ax, ay, az)
+        self.send_imu(yaw, pitch, roll, ax, ay, az, device=device)
 
 
 def sync_dashboard(path: str, payload: dict, host: str, port: int) -> None:
@@ -402,7 +486,8 @@ async def run_ble_async(state: SensorState, protocol: HybridOSCProtocol, args):
             for rr_ms in rr_intervals:
                 state.update_hr(bpm, rr_ms)
                 protocol.send_heartbeat(bpm, rr_ms)
-                sync_dashboard("/api/hybrid/hr/sync", {"bpm": bpm, "rr_ms": rr_ms, "confidence": 1.0},
+                sync_dashboard("/api/hybrid/hr/sync",
+                               {"device": "A", "bpm": bpm, "rr_ms": rr_ms, "confidence": 1.0},
                                args.dashboard_host, args.dashboard_port)
                 beat_count += 1
                 log.info("♥ beat #%d  %d BPM  (RR: %.0fms)", beat_count, bpm, rr_ms)
@@ -410,7 +495,8 @@ async def run_ble_async(state: SensorState, protocol: HybridOSCProtocol, args):
             rr_ms = 60000.0 / max(bpm, 1)
             state.update_hr(bpm, rr_ms)
             protocol.send_heartbeat(bpm, rr_ms)
-            sync_dashboard("/api/hybrid/hr/sync", {"bpm": bpm, "rr_ms": rr_ms, "confidence": 1.0},
+            sync_dashboard("/api/hybrid/hr/sync",
+                           {"device": "A", "bpm": bpm, "rr_ms": rr_ms, "confidence": 1.0},
                            args.dashboard_host, args.dashboard_port)
             beat_count += 1
             log.info("♥ beat #%d  %d BPM", beat_count, bpm)
@@ -459,7 +545,8 @@ def run_simulate(state: SensorState, protocol: HybridOSCProtocol, args):
 
             state.update_hr(current_bpm, rr_ms)
             protocol.send_heartbeat(current_bpm, rr_ms)
-            sync_dashboard("/api/hybrid/hr/sync", {"bpm": current_bpm, "rr_ms": rr_ms, "confidence": 1.0},
+            sync_dashboard("/api/hybrid/hr/sync",
+                           {"device": "A", "bpm": current_bpm, "rr_ms": rr_ms, "confidence": 1.0},
                            args.dashboard_host, args.dashboard_port)
             beat_count += 1
 
@@ -475,7 +562,7 @@ def run_simulate(state: SensorState, protocol: HybridOSCProtocol, args):
 
 # ─── IMU HTTP Server (Flask) ───────────────────────────────────────────────
 
-def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int,
+def run_imu_server(hub: HybridSensorHub, protocol: HybridOSCProtocol, port: int,
                     dashboard_host: str = "127.0.0.1", dashboard_port: int = DEFAULT_DASHBOARD_PORT):
     """Start a lightweight HTTP server to receive phone IMU data."""
     try:
@@ -503,11 +590,14 @@ def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int,
         """Receive IMU data from phone browser sensors.
 
         Expected JSON:
-          {"yaw": 45.0, "pitch": 10.0, "roll": 0.0,
+          {"device": "A", "yaw": 45.0, "pitch": 10.0, "roll": 0.0,
            "ax": 0.1, "ay": 0.0, "az": 9.8}
+        "device" defaults to "A" so single-phone senders (or any client that
+        predates multi-device support) need no changes.
         """
         try:
             data = request.get_json(force=True)
+            device = str(data.get("device") or "A")
             yaw = float(data.get("yaw", 0.0))
             pitch = float(data.get("pitch", 0.0))
             roll = float(data.get("roll", 0.0))
@@ -515,29 +605,31 @@ def run_imu_server(state: SensorState, protocol: HybridOSCProtocol, port: int,
             ay = float(data.get("ay", 0.0))
             az = float(data.get("az", 0.0))
 
+            state = hub.get(device)
             state.update_imu(yaw, pitch, roll, ax, ay, az)
-            protocol.send_imu(yaw, pitch, roll, ax, ay, az)
+            protocol.send_imu(yaw, pitch, roll, ax, ay, az, device=device)
             sync_dashboard("/api/hybrid/imu/sync",
-                           {"yaw": yaw, "pitch": pitch, "roll": roll, "ax": ax, "ay": ay, "az": az},
+                           {"device": device, "yaw": yaw, "pitch": pitch, "roll": roll,
+                            "ax": ax, "ay": ay, "az": az},
                            dashboard_host, dashboard_port)
 
-            return jsonify({"ok": True, "seq": state.seq})
+            return jsonify({"ok": True, "device": device, "seq": state.seq})
         except Exception as e:
             log.warning("IMU parse error: %s", e)
             return jsonify({"ok": False, "error": str(e)}), 400
 
     @app.route("/hybrid/status", methods=["GET"])
     def status_endpoint():
-        """Return current sensor state."""
-        return jsonify(state.to_dict())
+        """Return current sensor state for every device seen so far."""
+        return jsonify(hub.to_dict())
 
     @app.route("/hybrid/mode", methods=["POST"])
     def mode_endpoint():
-        """Set hybrid mode: 0=HR, 1=IMU, 2=Hybrid."""
+        """Set hybrid mode: 0=HR, 1=IMU, 2=Hybrid (global, not per-device)."""
         try:
             data = request.get_json(force=True)
             mode = int(data.get("mode", 0))
-            state.set_mode(mode)
+            hub.mode = mode
             protocol.send_mode(mode)
             return jsonify({"ok": True, "mode": mode})
         except Exception as e:
@@ -591,8 +683,8 @@ def main():
                              "0 disables the mirror")
     args = parser.parse_args()
 
-    # State + Protocol
-    state = SensorState()
+    # State (one SensorState per device, HR always on device "A") + Protocol
+    hub = HybridSensorHub()
     protocol = HybridOSCProtocol(host=args.target_host, port=args.target_port)
 
     log.info("=" * 55)
@@ -602,7 +694,7 @@ def main():
     log.info("  HR mode:  %s", args.mode)
     log.info("  IMU port: %d", args.imu_port)
     log.info("  OSC out:  %s:%d  ->  sclang", args.target_host, args.target_port)
-    log.info("  Protocol: /hybrid/sync/clock, /hybrid/hr, /hybrid/imu, /hybrid/mode")
+    log.info("  Protocol: /hybrid/sync/clock, /hybrid/hr[/<dev>], /hybrid/imu[/<dev>], /hybrid/mode")
     log.info("=" * 55)
 
     # Start clock sync thread
@@ -613,15 +705,15 @@ def main():
     # Start IMU HTTP server thread
     imu_t = threading.Thread(
         target=run_imu_server,
-        args=(state, protocol, args.imu_port, args.dashboard_host, args.dashboard_port),
+        args=(hub, protocol, args.imu_port, args.dashboard_host, args.dashboard_port),
         name="hybrid-imu", daemon=True)
     imu_t.start()
 
-    # Start HR mode
+    # Start HR mode (always device "A" — this bridge talks to one HR strap)
     if args.mode == "simulate":
-        run_simulate(state, protocol, args)
+        run_simulate(hub.get("A"), protocol, args)
     elif args.mode == "ble":
-        run_ble(state, protocol, args)
+        run_ble(hub.get("A"), protocol, args)
     elif args.mode == "off":
         log.info("HR mode is OFF. IMU server still running.")
         while True:

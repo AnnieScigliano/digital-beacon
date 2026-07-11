@@ -95,6 +95,23 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
     _loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _on_change():
+        # Pair-derived hybrid variables (sway energy, synchrony, pair energy)
+        # need a rolling buffer that only exists here in Python — sclang's
+        # OSCdefs can't compute them from a single message. Push them to SC
+        # on every change (not just hybrid updates — harmless, values are
+        # still correct) so beacon.scd/beacon_simple.scd's per-person
+        # register mapping (Phase 2 of the hug/dance roadmap) can use them
+        # too, same as digital_beacon/audio_engine.py's Shaper does.
+        try:
+            sc_osc.send_message("/hybrid/derived", [
+                store.get_hybrid_sway_energy("A"),
+                store.get_hybrid_sway_energy("B"),
+                store.get_hybrid_synchrony("A", "B"),
+                store.get_hybrid_pair_energy("A", "B"),
+            ])
+        except Exception:
+            log.debug("Derived-variable OSC push failed", exc_info=True)
+
         if _loop and _loop.is_running():
             data = store.to_dict()
             n_active = sum(1 for v in data.get("voices", {}).values() if v.get("active"))
@@ -388,9 +405,16 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
         return {"ok": True, "name": name, "state": state}
 
     # ─── REST: Hybrid Sensor endpoints ────────────────────────────────────
+    def _hybrid_osc_addr(base: str, device: str) -> str:
+        """Device "A" keeps the legacy bare address; any other device gets
+        a /<device> suffix. Matches beacon.scd/beacon_simple.scd's OSCdefs."""
+        return base if device == "A" else f"{base}/{device}"
+
     @app.get("/api/hybrid/status")
     async def hybrid_status():
-        """Return current hybrid sensor state (HR + IMU + mode)."""
+        """Return current hybrid sensor state (HR + IMU + mode), for every
+        device seen so far, plus legacy top-level "hr"/"imu" mirroring
+        device "A" for callers written before multi-device support."""
         bpm, rr_ms, conf = store.get_hybrid_hr()
         yaw, pitch, roll, ax, ay, az = store.get_hybrid_imu()
         return {
@@ -409,11 +433,32 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
                 "ay": ay,
                 "az": az,
             },
+            "devices": {
+                dev: {
+                    "hr": dict(zip(("bpm", "rr_ms", "confidence"), store.get_hybrid_hr(dev))),
+                    "imu": dict(zip(("yaw", "pitch", "roll", "ax", "ay", "az"), store.get_hybrid_imu(dev))),
+                }
+                for dev in store.get_hybrid_devices()
+            },
         }
+
+    @app.post("/api/hybrid/pan_sensitivity")
+    async def set_hybrid_pan_sensitivity(body: dict):
+        """Live control (Pair Mode only): multiplier on
+        config.HYBRID_PAIR_YAW_PAN_RANGE, 1.0 = 100% = default depth.
+        Takes effect immediately in both the Shaper and SC (via OSC) —
+        no restart needed, for dialing pan sensitivity during a live test."""
+        try:
+            value = float(body.get("value", 1.0))
+        except (TypeError, ValueError) as e:
+            raise HTTPException(400, f"invalid value: {e}")
+        store.set_hybrid_pan_sensitivity(value)
+        sc_osc.send_message("/hybrid/pan_sensitivity", [value])
+        return {"ok": True, "value": store.get_hybrid_pan_sensitivity()}
 
     @app.post("/api/hybrid/mode")
     async def set_hybrid_mode(body: dict):
-        """Switch hybrid mode: 0=HR-only, 1=IMU-only, 2=Hybrid."""
+        """Switch hybrid mode: 0=HR-only, 1=IMU-only, 2=Hybrid (global, not per-device)."""
         try:
             mode = int(body.get("mode", 2))
         except (TypeError, ValueError) as e:
@@ -425,8 +470,12 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
 
     @app.post("/api/hybrid/imu")
     async def post_hybrid_imu(body: dict):
-        """Direct HTTP endpoint for phone IMU data (alternative to bridge)."""
+        """Direct HTTP endpoint for phone IMU data (alternative to bridge).
+
+        "device" defaults to "A" so single-phone callers need no changes.
+        """
         try:
+            device = str(body.get("device") or "A")
             yaw = float(body.get("yaw", 0.0))
             pitch = float(body.get("pitch", 0.0))
             roll = float(body.get("roll", 0.0))
@@ -435,24 +484,25 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
             az = float(body.get("az", 0.0))
         except (TypeError, ValueError) as e:
             raise HTTPException(400, f"invalid imu data: {e}")
-        store.update_hybrid_imu(yaw, pitch, roll, ax, ay, az)
+        store.update_hybrid_imu(yaw, pitch, roll, ax, ay, az, device=device)
         # Forward to SC for spatial modulation
-        sc_osc.send_message("/hybrid/imu", [yaw, pitch, roll, ax, ay, az])
-        return {"ok": True, "imu": {"yaw": yaw, "pitch": pitch, "roll": roll}}
+        sc_osc.send_message(_hybrid_osc_addr("/hybrid/imu", device), [yaw, pitch, roll, ax, ay, az])
+        return {"ok": True, "device": device, "imu": {"yaw": yaw, "pitch": pitch, "roll": roll}}
 
     @app.post("/api/hybrid/hr")
     async def post_hybrid_hr(body: dict):
         """Direct HTTP endpoint for heart rate data (alternative to bridge)."""
         try:
+            device = str(body.get("device") or "A")
             bpm = float(body.get("bpm", 0.0))
             rr_ms = float(body.get("rr_ms", 0.0))
             confidence = float(body.get("confidence", 1.0))
         except (TypeError, ValueError) as e:
             raise HTTPException(400, f"invalid hr data: {e}")
-        store.update_hybrid_hr(bpm, rr_ms, confidence)
+        store.update_hybrid_hr(bpm, rr_ms, confidence, device=device)
         # Forward to SC for gain/shape modulation
-        sc_osc.send_message("/hybrid/hr", [bpm, rr_ms, confidence])
-        return {"ok": True, "hr": {"bpm": bpm, "rr_ms": rr_ms}}
+        sc_osc.send_message(_hybrid_osc_addr("/hybrid/hr", device), [bpm, rr_ms, confidence])
+        return {"ok": True, "device": device, "hr": {"bpm": bpm, "rr_ms": rr_ms}}
 
     @app.post("/api/hybrid/hr/sync")
     async def sync_hybrid_hr(body: dict):
@@ -464,12 +514,13 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
         capture (only values that came in through /api/hybrid/hr directly).
         """
         try:
+            device = str(body.get("device") or "A")
             bpm = float(body.get("bpm", 0.0))
             rr_ms = float(body.get("rr_ms", 0.0))
             confidence = float(body.get("confidence", 1.0))
         except (TypeError, ValueError) as e:
             raise HTTPException(400, f"invalid hr data: {e}")
-        store.update_hybrid_hr(bpm, rr_ms, confidence)
+        store.update_hybrid_hr(bpm, rr_ms, confidence, device=device)
         return {"ok": True}
 
     @app.post("/api/hybrid/imu/sync")
@@ -480,6 +531,7 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
         /imu endpoint (phone data arriving via the cloudflared tunnel).
         """
         try:
+            device = str(body.get("device") or "A")
             yaw = float(body.get("yaw", 0.0))
             pitch = float(body.get("pitch", 0.0))
             roll = float(body.get("roll", 0.0))
@@ -488,7 +540,7 @@ def create_app(store: VoiceParameterStore, recorder=None) -> "FastAPI":
             az = float(body.get("az", 0.0))
         except (TypeError, ValueError) as e:
             raise HTTPException(400, f"invalid imu data: {e}")
-        store.update_hybrid_imu(yaw, pitch, roll, ax, ay, az)
+        store.update_hybrid_imu(yaw, pitch, roll, ax, ay, az, device=device)
         return {"ok": True}
 
     # ─── REST: Recording (pw-record on PipeWire monitor) ────────────────

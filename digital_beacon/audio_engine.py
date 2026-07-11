@@ -11,12 +11,11 @@ Adapted from NaturalHarmony/harmonic_shaper/audio_engine.py:
 """
 
 import logging
+import math
 import threading
 from typing import Optional, Union
 
 import numpy as np
-
-import math
 
 try:
     import sounddevice as sd
@@ -29,6 +28,28 @@ from .state import VoiceParameterStore
 from . import config
 
 log = logging.getLogger(__name__)
+
+
+def _hybrid_register(n: int) -> str:
+    """Which hug/dance pair role (if any) a harmonic belongs to."""
+    if n in config.HYBRID_HARMONICS_A:
+        return "A"
+    if n in config.HYBRID_HARMONICS_B:
+        return "B"
+    if n in config.HYBRID_HARMONICS_SHARED:
+        return "SHARED"
+    return "NONE"
+
+
+def _person_pan_gain_mod(yaw: float, pitch: float, sway_energy: float) -> tuple[float, float]:
+    """A dancer's own (pan_mod, gain_mod) from their zeroed yaw/pitch/sway."""
+    yaw_norm = max(-1.0, min(1.0, yaw / 180.0))
+    pitch_norm = max(-1.0, min(1.0, pitch / 90.0))
+    sway_norm = min(sway_energy / config.HYBRID_PAIR_ENERGY_REF, 1.0)
+    pan_mod = yaw_norm * config.HYBRID_PAIR_YAW_PAN_RANGE
+    gain_mod = (sway_norm * config.HYBRID_PAIR_SWAY_GAIN_DEPTH
+                + pitch_norm * config.HYBRID_PAIR_LEAN_GAIN_DEPTH)
+    return pan_mod, gain_mod
 
 
 class AudioEngine:
@@ -148,28 +169,75 @@ class AudioEngine:
         mix = np.zeros((frames, 2), dtype=np.float32)
 
         # ── Hybrid sensor modulation (computed BEFORE voice loop for thread safety) ──
-        # HR → subtle master gain pulse + per-voice shape modulation
-        bpm, rr_ms, hr_conf = self._store.get_hybrid_hr()
-        hr_pulse = 0.0
-        hr_shape_mod = 0.0
-        if bpm > 0:
-            # Normalize BPM around 72: 72 → 0, range ±30 → ±depth
-            bpm_norm = (bpm - 72.0) / 30.0
-            bpm_norm = max(-1.0, min(1.0, bpm_norm))
-            hr_pulse = bpm_norm * config.HYBRID_HR_GAIN_DEPTH
-            hr_shape_mod = bpm_norm * config.HYBRID_HR_SHAPE_DEPTH
+        pair_mode = config.HYBRID_PAIR_MODE_ENABLED
+        synchrony = 0.0  # only meaningful in pair mode; read by the per-voice loop below
 
-        # IMU → per-voice pan modulation (yaw) + gain boost (accel)
-        yaw, pitch, roll, ax, ay, az = self._store.get_hybrid_imu()
-        imu_pan_mod = 0.0
-        imu_gain_boost = 0.0
-        if abs(yaw) > 0.01 or abs(pitch) > 0.01:
-            # Yaw → pan offset (±90° yaw → ±0.3 pan)
-            yaw_norm = yaw / 180.0  # -1..1
-            imu_pan_mod = yaw_norm * 0.3
-            # Accel magnitude → gain boost
-            accel_mag = math.sqrt(ax*ax + ay*ay + az*az)
-            imu_gain_boost = min(accel_mag / 20.0, 1.0) * config.HYBRID_ACCEL_GAIN_BOOST
+        if pair_mode:
+            # ── Hybrid PAIR modulation (two-phone hug/dance MVP, Phase 2) ──
+            # Opt-in only (config.HYBRID_PAIR_MODE_ENABLED) — device "A"'s and
+            # "B"'s own motion each primarily drive their own harmonic
+            # register (config.HYBRID_HARMONICS_A/B), not the whole field, so
+            # each dancer's contribution is audibly theirs. Each register
+            # also picks up a synchrony-scaled trace of the partner's own
+            # gain modulation (cross-bleed, gain-only — see
+            # HYBRID_PAIR_CROSS_BLEED_DEPTH) — clearly secondary to your own
+            # motion when unsynced, growing as you fall into sync. A shared
+            # band (HYBRID_HARMONICS_SHARED) is gated by pair synchrony:
+            # silent until the two are moving together, then it blooms. HR
+            # is intentionally excluded entirely — this mode is scoped to
+            # phone movement only, even if HR data happens to be flowing
+            # elsewhere.
+            hr_pulse = 0.0
+            hr_shape_mod = 0.0
+
+            yaw_a, pitch_a, _roll_a, _ax_a, _ay_a, _az_a = self._store.get_hybrid_imu("A")
+            yaw_b, pitch_b, _roll_b, _ax_b, _ay_b, _az_b = self._store.get_hybrid_imu("B")
+            sway_a = self._store.get_hybrid_sway_energy("A")
+            sway_b = self._store.get_hybrid_sway_energy("B")
+            synchrony = self._store.get_hybrid_synchrony("A", "B")
+            pair_energy = self._store.get_hybrid_pair_energy("A", "B")
+
+            pan_mod_a, gain_mod_a = _person_pan_gain_mod(yaw_a, pitch_a, sway_a)
+            pan_mod_b, gain_mod_b = _person_pan_gain_mod(yaw_b, pitch_b, sway_b)
+
+            # Live control knob (dashboard slider), not derived from motion —
+            # lets pan sensitivity be dialed during a live test with no restart.
+            pan_sensitivity = self._store.get_hybrid_pan_sensitivity()
+            pan_mod_a *= pan_sensitivity
+            pan_mod_b *= pan_sensitivity
+
+            cross_bleed = config.HYBRID_PAIR_CROSS_BLEED_DEPTH * synchrony
+            gain_mult_a = 1.0 + gain_mod_a + cross_bleed * gain_mod_b
+            gain_mult_b = 1.0 + gain_mod_b + cross_bleed * gain_mod_a
+
+            pair_energy_norm = min(pair_energy / config.HYBRID_PAIR_ENERGY_REF, 1.0)
+            pair_energy_pulse = pair_energy_norm * config.HYBRID_PAIR_ENERGY_GAIN_DEPTH
+        else:
+            # ── Legacy single-device Hybrid mode (unchanged since before
+            # pair mode existed) — HR → subtle master gain pulse + per-voice
+            # shape modulation; IMU (device "A") → the WHOLE field pans/
+            # boosts together, not a scoped register.
+            bpm, rr_ms, hr_conf = self._store.get_hybrid_hr()
+            hr_pulse = 0.0
+            hr_shape_mod = 0.0
+            if bpm > 0:
+                # Normalize BPM around 72: 72 → 0, range ±30 → ±depth
+                bpm_norm = (bpm - 72.0) / 30.0
+                bpm_norm = max(-1.0, min(1.0, bpm_norm))
+                hr_pulse = bpm_norm * config.HYBRID_HR_GAIN_DEPTH
+                hr_shape_mod = bpm_norm * config.HYBRID_HR_SHAPE_DEPTH
+
+            yaw, pitch, roll, ax, ay, az = self._store.get_hybrid_imu()
+            legacy_pan_mod = 0.0
+            legacy_gain_boost = 0.0
+            if abs(yaw) > 0.01 or abs(pitch) > 0.01:
+                # Yaw → pan offset (±90° yaw → ±0.3 pan)
+                yaw_norm = yaw / 180.0  # -1..1
+                legacy_pan_mod = yaw_norm * 0.3
+                # Accel magnitude → gain boost
+                accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+                legacy_gain_boost = min(accel_mag / 20.0, 1.0) * config.HYBRID_ACCEL_GAIN_BOOST
+            pair_energy_pulse = 0.0
 
         to_prune = []
         for n, state in self._voice_state.items():
@@ -202,6 +270,23 @@ class AudioEngine:
             if new_env <= 0.0:
                 continue
 
+            # ── Hybrid IMU modulation for this voice ──────────────────
+            if pair_mode:
+                register = _hybrid_register(n)
+                if register == "A":
+                    pan_add, gain_mult = pan_mod_a, gain_mult_a
+                elif register == "B":
+                    pan_add, gain_mult = pan_mod_b, gain_mult_b
+                elif register == "SHARED":
+                    # Gated by synchrony, not boosted from a baseline: silent
+                    # until the pair is moving together, then it blooms.
+                    pan_add, gain_mult = 0.0, synchrony
+                else:
+                    pan_add, gain_mult = 0.0, 1.0
+            else:
+                # Legacy: every voice gets the same whole-field pan/gain.
+                pan_add, gain_mult = legacy_pan_mod, 1.0 + legacy_gain_boost
+
             # ── LFO modulation per voice ──────────────────────────────
             lfo_mod = lfo_val * lfo_amount
             mod_gain = params.gain * (1.0 + params.lfo_gain * lfo_mod)
@@ -224,8 +309,8 @@ class AudioEngine:
                 drive = 1.0 + voice_shape * 4.0
                 sine = np.tanh(sine * drive) / np.tanh(drive)
 
-            # Apply IMU gain boost
-            voice_gain = mod_gain * (1.0 + imu_gain_boost)
+            # Apply this voice's hybrid-pair gain modulation
+            voice_gain = mod_gain * gain_mult
             voice_gain = min(voice_gain, 1.0)
 
             sine *= float(voice_gain) * norm * new_env
@@ -233,8 +318,8 @@ class AudioEngine:
                 carrier_phases[-1] + 2.0 * np.pi * params.freq / self._sample_rate
             ) % (2.0 * np.pi)
 
-            # Apply IMU pan modulation to the voice
-            voice_pan = mod_pan + imu_pan_mod
+            # Apply this voice's hybrid-pair pan modulation
+            voice_pan = mod_pan + pan_add
             voice_pan = max(-1.0, min(1.0, voice_pan))
 
             angle = (float(voice_pan) + 1.0) * (np.pi / 4.0)
@@ -252,8 +337,8 @@ class AudioEngine:
         else:
             sc_factor = 1.0 + abs(sidechain_amount) * (1.0 - beacon_level)
 
-        # Master gain + side-chain + HR pulse + soft limiter
-        mix *= self._store.get_master_gain() * sc_factor * (1.0 + hr_pulse)
+        # Master gain + side-chain + HR pulse + pair-energy breathing + soft limiter
+        mix *= self._store.get_master_gain() * sc_factor * (1.0 + hr_pulse) * (1.0 + pair_energy_pulse)
 
         # ── Recording tap: hand a copy of the final mix to the recorder
         #    BEFORE the soft limiter, so the Recorder can do its own

@@ -13,7 +13,11 @@
 #   ./start.sh --live             (SoundIn(0) — R24 CH1)
 #   ./start.sh --no-shaper        (beacon only)
 #   ./start.sh --no-bridge        (beacon + shaper, f1 stays fixed)
-#   ./start.sh --hybrid           (enable Fitbit HR + Phone IMU bridge)
+#   ./start.sh --hybrid                    (enable Fitbit HR + Phone IMU bridge, HR mode: simulate)
+#   ./start.sh --hybrid --hybrid-mode off  (IMU only — NO simulated or real HR at all;
+#                                            use this for the movement-only two-phone
+#                                            hug/dance test case, i.e. Pair Mode)
+#   ./start.sh --hybrid --hybrid-mode ble  (real Fitbit HR via BLE)
 #
 # Hard stop: Ctrl-C cleans up all child PIDs.
 
@@ -27,15 +31,23 @@ USE_FILE=0
 RUN_SHAPER=1
 RUN_BRIDGE=1
 RUN_HYBRID=0
+HYBRID_MODE="simulate"   # hybrid_bridge.py's own default — preserved unless --hybrid-mode overrides it
 EXTRA_PY_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --file)        USE_FILE=1; shift ;;
-    --live)        USE_FILE=0; shift ;;
-    --no-shaper)   RUN_SHAPER=0; shift ;;
-    --no-bridge)   RUN_BRIDGE=0; shift ;;
-    --hybrid)      RUN_HYBRID=1; shift ;;
+    --file)         USE_FILE=1; shift ;;
+    --live)         USE_FILE=0; shift ;;
+    --no-shaper)    RUN_SHAPER=0; shift ;;
+    --no-bridge)    RUN_BRIDGE=0; shift ;;
+    --hybrid)       RUN_HYBRID=1; shift ;;
+    --hybrid-mode)
+      HYBRID_MODE="$2"
+      case "$HYBRID_MODE" in
+        simulate|ble|off) ;;
+        *) echo "ERROR: --hybrid-mode must be simulate, ble, or off (got: $HYBRID_MODE)"; exit 1 ;;
+      esac
+      shift 2 ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -230,15 +242,18 @@ fi
 HYBRID_PID=
 if [[ $RUN_HYBRID -eq 1 ]]; then
   echo ""
-  echo ">>> [4/5] Starting hybrid_bridge.py (Fitbit HR + Phone IMU) ..."
-  ./venv/bin/python3 hybrid_bridge.py --imu-port 5051 > /tmp/digital-beacon-hybrid.log 2>&1 &
+  echo ">>> [4/5] Starting hybrid_bridge.py (HR mode: $HYBRID_MODE, Phone IMU) ..."
+  if [[ "$HYBRID_MODE" == "off" ]]; then
+    echo "  HR mode is OFF — no simulated or real heart-rate data will be generated."
+  fi
+  ./venv/bin/python3 hybrid_bridge.py --mode "$HYBRID_MODE" --imu-port 5051 > /tmp/digital-beacon-hybrid.log 2>&1 &
   HYBRID_PID=$!
   echo "  hybrid PID: $HYBRID_PID  (log: /tmp/digital-beacon-hybrid.log)"
   echo "  IMU endpoint: POST http://localhost:5051/imu"
   echo "  Connect phone IMU app to this endpoint"
 else
   echo ""
-  echo ">>> [4/5] Skipping hybrid_bridge (use --hybrid to enable)"
+  echo ">>> [4/5] Skipping hybrid_bridge (use --hybrid to enable, --hybrid-mode off/ble/simulate to choose HR source)"
 fi
 
 # ─── 5. digital_beacon Shaper ────────────────────────────────────────────────
@@ -291,6 +306,9 @@ echo ""
 echo "=========================================="
 echo "  digital-beacon running"
 echo "  PIDs: scsynth=$SCSYNTH_PID sclang=$SCLANG_PID bridge=$BRIDGE_PID hybrid=$HYBRID_PID shaper=$SHAPER_PID"
+if [[ $RUN_HYBRID -eq 1 ]]; then
+  echo "  Hybrid HR mode: $HYBRID_MODE"
+fi
 echo "  Logs:"
 echo "    scsynth: tail -f /tmp/digital-beacon-scsynth.log"
 echo "    sclang:  tail -f /tmp/digital-beacon-sclang.log"

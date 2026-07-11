@@ -171,6 +171,7 @@
     <div class="mix-section" id="hybrid-panel">
         <div style="font-size:0.6rem;color:#888;text-transform:uppercase;margin-bottom:6px;">
             Hybrid Sensors <span id="hybrid-stale" style="color:#e74c3c;"></span>
+            <span id="hy-devices" style="color:#2ecc71;text-transform:none;"></span>
         </div>
         <div class="mix-grid">
             <div class="mix-param"><label class="sl" style="color:#e74c3c;">BPM</label>
@@ -196,6 +197,35 @@
             <div class="mix-param"><label class="sl" style="color:#3498db;">Accel boost</label>
                 <div class="val" id="hy-boost">0.0%</div></div>
         </div>
+        <!-- Pair-derived (Phase 1): drives sound only when Pair Mode is on
+             (config.HYBRID_PAIR_MODE_ENABLED / beacon*.scd's
+             hybridPairModeEnabled, both off by default) — always computed
+             and shown here regardless, so it can be sanity-checked. -->
+        <div class="mix-grid" style="margin-top:6px;">
+            <div class="mix-param"><label class="sl" style="color:#9b59b6;">Sway A/B</label>
+                <div class="val" id="hy-sway">0.00 / 0.00</div></div>
+            <div class="mix-param"><label class="sl" style="color:#9b59b6;">Pair energy</label>
+                <div class="val" id="hy-pair-energy">0.00</div></div>
+            <div class="mix-param"><label class="sl" style="color:#9b59b6;">Synchrony</label>
+                <div class="val" id="hy-synchrony">0.00</div></div>
+            <div class="mix-param"><label class="sl" style="color:#9b59b6;">Rel. facing°</label>
+                <div class="val" id="hy-facing">0.0</div></div>
+        </div>
+        <!-- Live control (Pair Mode only), not a readout — takes effect
+             immediately in both the Shaper and SC, no restart needed. -->
+        <div class="mix-grid" style="margin-top:6px;">
+            <div class="mix-param"><label class="sl" style="color:#f39c12;">Pan Sensitivity</label>
+                <input type="range" min="0" max="300" step="1" value="100" id="pan-sensitivity"
+                       oninput="sendPanSensitivity(this.value); showVal('pan-sensitivity-val', this.value+'%')">
+                <div class="val" id="pan-sensitivity-val">100%</div></div>
+        </div>
+        <!-- Phase 3: abstract visualization of the above — NOT motion
+             capture. Phone IMU alone can't give real body position, so this
+             draws only what's actually measured: each device's zeroed
+             facing direction (needle), sway energy (halo size), synchrony
+             (connector thickness/glow), and pair energy (center pulse). -->
+        <canvas id="pair-canvas" width="320" height="160"
+                style="display:block;margin:8px auto 0;background:#0d0d14;border-radius:6px;border:1px solid #1a1a2e;max-width:100%;"></canvas>
     </div>
 
     <div class="grid" id="grid"></div>
@@ -369,6 +399,31 @@ function applyHybridState(h) {
   document.getElementById('hy-pan').textContent = panMod.toFixed(2);
   document.getElementById('hy-boost').textContent = '+' + (boost*100).toFixed(1) + '%';
 
+  // Connected devices — the flat fields above still only reflect device
+  // "A"; this confirms who else has sent data (see drawPairViz below for
+  // the per-device breakdown).
+  const devs = h.devices ? Object.keys(h.devices) : [];
+  document.getElementById('hy-devices').textContent = devs.length ? '(' + devs.join(', ') + ')' : '';
+
+  // Pair-derived variables (Phase 1) — server-computed, just displayed here.
+  const d = h.derived || {};
+  document.getElementById('hy-sway').textContent =
+    (d.sway_energy_a || 0).toFixed(2) + ' / ' + (d.sway_energy_b || 0).toFixed(2);
+  document.getElementById('hy-pair-energy').textContent = (d.pair_energy || 0).toFixed(2);
+  document.getElementById('hy-synchrony').textContent = (d.pair_synchrony || 0).toFixed(2);
+  document.getElementById('hy-facing').textContent = (d.relative_facing_deg || 0).toFixed(1);
+
+  // Reflect the live pan-sensitivity control's server state, but don't
+  // fight the user while they're actively dragging it.
+  const panSensEl = document.getElementById('pan-sensitivity');
+  if (panSensEl && document.activeElement !== panSensEl) {
+    const pct = Math.round((h.pan_sensitivity !== undefined ? h.pan_sensitivity : 1.0) * 100);
+    panSensEl.value = pct;
+    showVal('pan-sensitivity-val', pct + '%');
+  }
+
+  drawPairViz(h);
+
   // Staleness: flag if nothing has actually changed value in a while — a
   // frozen sensor (dropped BLE/tunnel) still looks "live" otherwise.
   const snapshot = JSON.stringify([bpm, rr, conf, yaw, pitch, ax, ay, az]);
@@ -378,6 +433,85 @@ setInterval(() => {
   const stale = (Date.now() - lastHybridChangeAt) > 5000;
   document.getElementById('hybrid-stale').textContent = stale ? '(stale — no updates in 5s+)' : '';
 }, 1000);
+
+// Pair Mode telemetry canvas (Phase 3) — deliberately abstract. A phone's
+// IMU alone cannot give real body position (no GPS-grade indoor
+// positioning, no distance sensor), so this does NOT pretend to draw where
+// the two dancers are — it draws only what's actually measured: each
+// device's own zeroed yaw (a needle), sway energy (halo size), pair
+// synchrony (connector thickness/glow), and combined pair energy (center
+// pulse). See digital_beacon/state.py's get_hybrid_sway_energy/_synchrony/
+// _pair_energy for where these numbers come from.
+const pairCanvas = document.getElementById('pair-canvas');
+const pairCtx = pairCanvas ? pairCanvas.getContext('2d') : null;
+const PAIR_ENERGY_REF = 3.0; // must match config.HYBRID_PAIR_ENERGY_REF — just for visual scaling here
+
+function drawPersonGlyph(x, y, yawDeg, sway, color, facingRight, label) {
+  const haloR = 10 + Math.min(sway / PAIR_ENERGY_REF, 1) * 18;
+
+  pairCtx.beginPath();
+  pairCtx.arc(x, y, haloR, 0, Math.PI * 2);
+  pairCtx.fillStyle = color + '33'; // ~20% alpha (8-digit hex)
+  pairCtx.fill();
+
+  pairCtx.beginPath();
+  pairCtx.arc(x, y, 6, 0, Math.PI * 2);
+  pairCtx.fillStyle = color;
+  pairCtx.fill();
+
+  // Needle: 0° = facing the partner, matching the sender page's
+  // calibration convention (zero yaw/pitch on Start, ideally while facing
+  // each other) — this is "which way am I facing relative to when I
+  // started," not an absolute compass reading.
+  const baseAngle = facingRight ? 0 : Math.PI;
+  const angle = baseAngle + (yawDeg * Math.PI / 180);
+  const needleLen = haloR + 14;
+  pairCtx.beginPath();
+  pairCtx.moveTo(x, y);
+  pairCtx.lineTo(x + Math.cos(angle) * needleLen, y + Math.sin(angle) * needleLen);
+  pairCtx.strokeStyle = color;
+  pairCtx.lineWidth = 2;
+  pairCtx.stroke();
+
+  pairCtx.fillStyle = '#888';
+  pairCtx.font = '9px sans-serif';
+  pairCtx.textAlign = 'center';
+  pairCtx.fillText(label, x, y + haloR + 16);
+}
+
+function drawPairViz(h) {
+  if (!pairCtx) return;
+  const W = pairCanvas.width, H = pairCanvas.height;
+  const cx = W / 2, cy = H / 2;
+  const ax = W * 0.3, bx = W * 0.7;
+
+  pairCtx.clearRect(0, 0, W, H);
+
+  const d = h.derived || {};
+  const devices = h.devices || {};
+  const swayA = d.sway_energy_a || 0, swayB = d.sway_energy_b || 0;
+  const synchrony = d.pair_synchrony || 0, pairEnergy = d.pair_energy || 0;
+  const yawA = (devices.A || {}).yaw || 0;
+  const yawB = (devices.B || {}).yaw || 0;
+
+  // Pair-energy "breathing" ring, centered between the two.
+  const pulseR = 16 + Math.min(pairEnergy / PAIR_ENERGY_REF, 1) * 40;
+  pairCtx.beginPath();
+  pairCtx.arc(cx, cy, pulseR, 0, Math.PI * 2);
+  pairCtx.fillStyle = `rgba(155, 89, 182, ${0.08 + Math.min(pairEnergy / PAIR_ENERGY_REF, 1) * 0.18})`;
+  pairCtx.fill();
+
+  // Synchrony connector.
+  pairCtx.beginPath();
+  pairCtx.moveTo(ax, cy);
+  pairCtx.lineTo(bx, cy);
+  pairCtx.strokeStyle = `rgba(26, 188, 156, ${0.15 + synchrony * 0.75})`;
+  pairCtx.lineWidth = 1 + synchrony * 6;
+  pairCtx.stroke();
+
+  drawPersonGlyph(ax, cy, yawA, swayA, '#3498db', true, 'A');
+  drawPersonGlyph(bx, cy, yawB, swayB, '#e67e22', false, 'B');
+}
 
 function applyScState() {
   for (let n=1;n<=N;n++) {
@@ -404,6 +538,7 @@ function sendS(param,n,v){api('/api/shaper/'+n+'/'+param,'POST',{[param]:parseFl
 function sendGlobal(param,v){const f=parseFloat(v);api('/api/shaper/global/'+param,'POST',{[param]:f});}
 function sendLfoWaveform(v){api('/api/shaper/global/lfo_waveform','POST',{lfo_waveform:v});}
 function sendMaster(v){api('/api/master','POST',{master:parseFloat(v)});}
+function sendPanSensitivity(pct){api('/api/hybrid/pan_sensitivity','POST',{value:parseFloat(pct)/100});}
 function sendF1(v){api('/api/f1','POST',{f1:parseFloat(v)});}
 function sendVsrate(v){api('/api/vsource','POST',{rate:parseFloat(v)});}
 function toggleOn(n,btn){const v=scState.on[n]?0:1;scState.on[n]=v;applyScState();api('/api/harmonic/'+n+'/on','POST',{on:v===1});}

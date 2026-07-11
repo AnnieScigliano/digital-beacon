@@ -55,6 +55,41 @@ server.options.blockSize = 64;
 server.startAliveThread(0.4);
 server.doWhenBooted({
   var cond = Condition.new;
+  var applyHybridHr, applyHybridImu, applyHybridRegisters, applyMasterGain;
+  // Hug/dance PAIR MODE (Phase 2) — OPT-IN, off by default. Must match
+  // config.HYBRID_PAIR_MODE_ENABLED in digital_beacon/config.py: when false
+  // (the default), IMU behaves exactly as it did before pair mode existed
+  // (whole-field yaw rotation + HR gain/shape) — completely unaffected by
+  // any of this. Flip to true (and restart sclang) only for the two-phone
+  // movement-only test case; there's no live OSC toggle by design, same as
+  // Python's config constant — this is a "which test case am I running"
+  // choice, not a runtime performance control.
+  var hybridPairModeEnabled = true;
+  // Must match config.HYBRID_HARMONICS_A/B/SHARED and config.HYBRID_PAIR_*
+  // in digital_beacon/config.py exactly, so this engine and the Python
+  // Shaper behave the same way for the same motion, when pair mode is on.
+  var hybridHarmonicsA = (1..10);
+  var hybridHarmonicsB = (11..20);
+  var hybridHarmonicsShared = (21..28);
+  var hybridPairEnergyRef = 3.0;
+  var hybridSwayGainDepth = 0.5;
+  var hybridLeanGainDepth = 0.2;
+  var hybridYawAzRange = 90.0;         // SC's own unit (az degrees); Python's
+                                        // equivalent is HYBRID_PAIR_YAW_PAN_RANGE (pan units)
+  var hybridPairEnergyGainDepth = 0.25;
+  // Fraction of your partner's OWN gain modulation that bleeds into your own
+  // register's gain, scaled by current synchrony — gain-only, never pan.
+  // Must match config.HYBRID_PAIR_CROSS_BLEED_DEPTH.
+  var hybridCrossBleedDepth = 0.35;
+  // Latest known per-device / pair-derived values — each arrives on its own
+  // OSC message at its own rate, so we cache and reapply together rather
+  // than compute directly inside each OSCdef.
+  var yawA = 0.0, pitchA = 0.0, yawB = 0.0, pitchB = 0.0;
+  var swayA = 0.0, swayB = 0.0, synchrony = 0.0, pairEnergy = 0.0;
+  var hrPulse = 0.0;
+  // Live control knob (dashboard slider), not derived from motion — lets
+  // pan sensitivity be dialed during a live test with no restart.
+  var panSensitivity = 1.0;
 
   // Defaults: uniform gain, az array spreads bands around the head.
   // Bands 1-6 close in, 7-12 mid, 13-20 wider, 21-32 back to center.
@@ -275,84 +310,186 @@ server.doWhenBooted({
     "[RESET] All bands restored.".postln;
   }, "/beacon/reset"));
 
-  // ─── Hybrid sensor OSCdefs ────────────────────────────────────────────────
+  // ─── Hybrid sensor OSCdefs (Phase 2: per-person pair mapping) ────────────
   // These receive on this sclang's own OSC port (57120) from either
   // hybrid_bridge.py's internal BLE/simulate capture or api.py's
   // /api/hybrid/* HTTP endpoints, and modulate the binaural spatializer
   // in real-time with body sensor data.
+  //
+  // Splits the 32 harmonics into per-person registers plus a shared
+  // synchrony-gated "bloom" band — mirrors digital_beacon/audio_engine.py's
+  // mapping exactly (same harmonic ranges, same HYBRID_PAIR_* depths) so the
+  // Shaper and this SC engine respond the same way to the same motion.
+  // Device A/B's own yaw/pitch arrive via /hybrid/imu[/B]; the sway-energy/
+  // synchrony/pair-energy values need a rolling buffer no single OSC message
+  // carries, so they're computed in Python (digital_beacon/state.py) and
+  // pushed here via /hybrid/derived (see digital_beacon/api.py's _on_change).
 
-  // /hybrid/hr — Heart Rate → master gain pulse + band shape modulation
-  // BPM > 72 → brighter (more shape), BPM < 72 → darker (less shape)
-  oscdefs = oscdefs.add(OSCdef(\hybrid_hr, { |msg|
+  // Recombines HR pulse + pair-energy pulse into master gain — both target
+  // the same scalar, so they're composed here rather than each calling
+  // synth.set(\master, ...) directly (which would just have whichever
+  // OSCdef fires last silently overwrite the other's effect). Only reached
+  // from pair-mode code paths below.
+  applyMasterGain = {
+    var pairEnergyNorm = (pairEnergy / hybridPairEnergyRef).clip(0.0, 1.0);
+    var pairEnergyPulse = pairEnergyNorm * hybridPairEnergyGainDepth;
+    synth.set(\master, (master0 * (1.0 + hrPulse) * (1.0 + pairEnergyPulse)).clip(0.0, 3.0));
+  };
+
+  // Reapplies the full per-register azimuth/gain from whatever's currently
+  // cached (yawA/pitchA/swayA/..., synchrony) — called after ANY of the
+  // underlying OSC messages updates one piece of it. No-op unless pair
+  // mode is on (harmless if /hybrid/derived arrives regardless of mode).
+  applyHybridRegisters = {
+    if (hybridPairModeEnabled) {
+      var yawNormA, pitchNormA, swayNormA, panModA, gainModA;
+      var yawNormB, pitchNormB, swayNormB, panModB, gainModB;
+      var crossBleed, gainMultA, gainMultB;
+
+      yawNormA = (yawA / 180.0).clip(-1.0, 1.0);
+      pitchNormA = (pitchA / 90.0).clip(-1.0, 1.0);
+      swayNormA = (swayA / hybridPairEnergyRef).clip(0.0, 1.0);
+      panModA = yawNormA * hybridYawAzRange * panSensitivity;
+      gainModA = (swayNormA * hybridSwayGainDepth) + (pitchNormA * hybridLeanGainDepth);
+
+      yawNormB = (yawB / 180.0).clip(-1.0, 1.0);
+      pitchNormB = (pitchB / 90.0).clip(-1.0, 1.0);
+      swayNormB = (swayB / hybridPairEnergyRef).clip(0.0, 1.0);
+      panModB = yawNormB * hybridYawAzRange * panSensitivity;
+      gainModB = (swayNormB * hybridSwayGainDepth) + (pitchNormB * hybridLeanGainDepth);
+
+      // Partner cross-bleed: a synchrony-scaled trace of the OTHER
+      // person's own gain modulation, gain-only (pan stays purely
+      // self-driven so each register's stereo position stays legible).
+      crossBleed = hybridCrossBleedDepth * synchrony;
+      gainMultA = 1.0 + gainModA + (crossBleed * gainModB);
+      gainMultB = 1.0 + gainModB + (crossBleed * gainModA);
+
+      hybridHarmonicsA.do { |n|
+        var baseAz = defaultAz[n - 1];
+        var baseGain = defaultGains[n - 1];
+        synth.set(("az" ++ n).asSymbol, (baseAz + panModA).wrap(-180, 180));
+        synth.set(("gain" ++ n).asSymbol, (baseGain * gainMultA).clip(0.0, 3.0));
+      };
+      hybridHarmonicsB.do { |n|
+        var baseAz = defaultAz[n - 1];
+        var baseGain = defaultGains[n - 1];
+        synth.set(("az" ++ n).asSymbol, (baseAz + panModB).wrap(-180, 180));
+        synth.set(("gain" ++ n).asSymbol, (baseGain * gainMultB).clip(0.0, 3.0));
+      };
+      hybridHarmonicsShared.do { |n|
+        var baseGain = defaultGains[n - 1];
+        // Gated by synchrony, not boosted from a baseline: silent until the
+        // pair is moving together, then it blooms.
+        synth.set(("gain" ++ n).asSymbol, (baseGain * synchrony).clip(0.0, 3.0));
+      };
+
+      applyMasterGain.value;
+    };
+  };
+
+  // /hybrid/hr — pair mode ON: HR is intentionally excluded (movement-only
+  // test case) — hrPulse forced to 0, no band gains touched (those are
+  // fully owned by applyHybridRegisters). Pair mode OFF (default):
+  // unchanged since before pair mode existed — HR alone drives master
+  // pulse + upper-band (17-32) brightness shift.
+  applyHybridHr = { |msg, tag|
     var bpm = msg[1].asFloat;
     var rr_ms = msg[2].asFloat;
     var confidence = msg[3].asFloat;
     var bpm_norm = ((bpm - 72) / 30).clip(-1.0, 1.0);
-    var hr_pulse = bpm_norm * 0.30;  // ±30% master gain
     var hr_shape = bpm_norm * 0.45;  // ±45% shape modulation
-    var current_master, band_shift;
 
-    // Apply master gain pulse
-    current_master = master0;  // base
-    synth.set(\master, (current_master * (1.0 + hr_pulse)).clip(0.0, 3.0));
-
-    // Modulate shape of all active bands
-    nBands.do { |i|
-      var n = i + 1;
-      var current_gain = defaultGains[i];
-      // Brightness shift: higher BPM → higher gain on upper bands
-      band_shift = if (i > 15) { hr_shape } { 0 };
-      synth.set(("gain" ++ n).asSymbol, (current_gain + band_shift).clip(0.0, 3.0));
+    if (hybridPairModeEnabled) {
+      hrPulse = 0.0;
+      applyMasterGain.value;
+    } {
+      var hr_pulse = bpm_norm * 0.30;  // ±30% master gain
+      synth.set(\master, (master0 * (1.0 + hr_pulse)).clip(0.0, 3.0));
+      nBands.do { |i|
+        var n = i + 1;
+        var current_gain = defaultGains[i];
+        var band_shift = if (i > 15) { hr_shape } { 0 };
+        synth.set(("gain" ++ n).asSymbol, (current_gain + band_shift).clip(0.0, 3.0));
+      };
     };
 
-    "  [HYBRID HR] BPM=%  RR=%ms  conf=%  pulse=%  shape=%".format(
-      bpm.round(0.1), rr_ms.round(0.1), confidence.round(0.01), hr_pulse.round(0.001), hr_shape.round(0.001)
+    "  [HYBRID HR %] BPM=%  RR=%ms  conf=%  pairMode=%".format(
+      tag, bpm.round(0.1), rr_ms.round(0.1), confidence.round(0.01), hybridPairModeEnabled
     ).postln;
-  }, "/hybrid/hr"));
+  };
+  oscdefs = oscdefs.add(OSCdef(\hybrid_hr_a, { |msg| applyHybridHr.value(msg, "A") }, "/hybrid/hr"));
+  oscdefs = oscdefs.add(OSCdef(\hybrid_hr_b, { |msg| applyHybridHr.value(msg, "B") }, "/hybrid/hr/B"));
 
-  // /hybrid/imu — IMU orientation → azimuth rotation + elevation tilt
-  // Yaw → rotate all azimuths, Pitch → elevation (not directly in FoaPanB,
-  // so we map to subtle gain modulation on front/back bands)
-  oscdefs = oscdefs.add(OSCdef(\hybrid_imu, { |msg|
+  // /hybrid/imu — pair mode ON: yaw/pitch update this device's cached
+  // values, then reapply the full per-register mapping (accel's role in
+  // pair mode is the rolling-window pair energy from /hybrid/derived, not
+  // an instantaneous per-message reading). Pair mode OFF (default):
+  // unchanged since before pair mode existed — yaw rotates the whole
+  // field, pitch tilts front-band gain, accel boosts master gain directly.
+  applyHybridImu = { |msg, tag|
     var yaw = msg[1].asFloat;    // -180..180
     var pitch = msg[2].asFloat;  // -90..90
     var roll = msg[3].asFloat;   // -180..180
     var ax = msg[4].asFloat;
     var ay = msg[5].asFloat;
     var az = msg[6].asFloat;
-    var yaw_offset, pitch_mod, accel_mag, accel_boost;
 
-    // Yaw → rotate all azimuths by yaw offset
-    yaw_offset = yaw.clip(-180, 180);
-    nBands.do { |i|
-      var n = i + 1;
-      var base_az = defaultAz[i];
-      var new_az = (base_az + yaw_offset).wrap(-180, 180);
-      synth.set(("az" ++ n).asSymbol, new_az);
-    };
-
-    // Pitch → subtle elevation: tilt forward (pitch > 0) → boost front bands
-    // We approximate by modulating gain on bands with az near 0°
-    pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.4;
-    nBands.do { |i|
-      var n = i + 1;
-      var base_az = defaultAz[i];
-      var is_front = (base_az.abs < 45);
-      if (is_front) {
-        var current_gain = defaultGains[i];
-        synth.set(("gain" ++ n).asSymbol, (current_gain + pitch_mod).clip(0.0, 3.0));
+    if (hybridPairModeEnabled) {
+      if (tag == "A") {
+        yawA = yaw; pitchA = pitch;
+      } {
+        yawB = yaw; pitchB = pitch;
       };
+      applyHybridRegisters.value;
+    } {
+      var yaw_offset = yaw.clip(-180, 180);
+      var pitch_mod = (pitch / 90).clip(-1.0, 1.0) * 0.4;
+      var accel_mag = (ax.squared + ay.squared + az.squared).sqrt;
+      var accel_boost = (accel_mag / 20).clip(0, 1) * 0.35;
+
+      nBands.do { |i|
+        var n = i + 1;
+        var base_az = defaultAz[i];
+        var new_az = (base_az + yaw_offset).wrap(-180, 180);
+        synth.set(("az" ++ n).asSymbol, new_az);
+      };
+      nBands.do { |i|
+        var n = i + 1;
+        var base_az = defaultAz[i];
+        var is_front = (base_az.abs < 45);
+        if (is_front) {
+          var current_gain = defaultGains[i];
+          synth.set(("gain" ++ n).asSymbol, (current_gain + pitch_mod).clip(0.0, 3.0));
+        };
+      };
+      synth.set(\master, (master0 * (1.0 + accel_boost)).clip(0.0, 3.0));
     };
 
-    // Acceleration magnitude → global brightness
-    accel_mag = (ax.squared + ay.squared + az.squared).sqrt;
-    accel_boost = (accel_mag / 20).clip(0, 1) * 0.35;
-    synth.set(\master, (master0 * (1.0 + accel_boost)).clip(0.0, 3.0));
-
-    "  [HYBRID IMU] yaw=%°  pitch=%°  roll=%°  accel=%  boost=%".format(
-      yaw.round(0.1), pitch.round(0.1), roll.round(0.1), accel_mag.round(0.1), accel_boost.round(0.001)
+    "  [HYBRID IMU %] yaw=%°  pitch=%°  roll=%°  pairMode=%".format(
+      tag, yaw.round(0.1), pitch.round(0.1), roll.round(0.1), hybridPairModeEnabled
     ).postln;
-  }, "/hybrid/imu"));
+  };
+  oscdefs = oscdefs.add(OSCdef(\hybrid_imu_a, { |msg| applyHybridImu.value(msg, "A") }, "/hybrid/imu"));
+  oscdefs = oscdefs.add(OSCdef(\hybrid_imu_b, { |msg| applyHybridImu.value(msg, "B") }, "/hybrid/imu/B"));
+
+  // /hybrid/derived — [sway_a, sway_b, synchrony, pair_energy], pushed by
+  // digital_beacon/api.py on every store change.
+  oscdefs = oscdefs.add(OSCdef(\hybrid_derived, { |msg|
+    swayA = msg[1].asFloat;
+    swayB = msg[2].asFloat;
+    synchrony = msg[3].asFloat;
+    pairEnergy = msg[4].asFloat;
+    applyHybridRegisters.value;
+  }, "/hybrid/derived"));
+
+  // /hybrid/pan_sensitivity — [value], live control knob (dashboard slider),
+  // pushed by digital_beacon/api.py's POST /api/hybrid/pan_sensitivity.
+  oscdefs = oscdefs.add(OSCdef(\hybrid_pan_sensitivity, { |msg|
+    panSensitivity = msg[1].asFloat;
+    applyHybridRegisters.value;
+    "  [HYBRID PAN SENSITIVITY] % (%pct)".format(panSensitivity, (panSensitivity * 100).round(1)).postln;
+  }, "/hybrid/pan_sensitivity"));
 
   // /hybrid/mode — switch between HR-only, IMU-only, or Hybrid
   oscdefs = oscdefs.add(OSCdef(\hybrid_mode, { |msg|
@@ -371,7 +508,7 @@ server.doWhenBooted({
     // "  [HYBRID SYNC] ts=%  seq=%  bpm_ref=%".format(timestamp, seq, bpm_ref).postln;
   }, "/hybrid/sync/clock"));
 
-  "OSCdefs registered: 32 gain + 32 az + 32 on + vsource + f1 + master + panic + reset + hybrid (102 total).".postln;
+  "OSCdefs registered: 32 gain + 32 az + 32 on + vsource + f1 + master + panic + reset + hybrid A/B (% total).".format(oscdefs.size).postln;
 
   // Cleanup
   ServerQuit.add({

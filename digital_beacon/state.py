@@ -8,13 +8,44 @@ Adapted from NaturalHarmony/harmonic_shaper/state.py:
   push updates without touching VoiceParams.
 """
 
+import collections
 import math
 import threading
+import time
 from copy import copy
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import config
+
+
+def _pearson_correlation(a: list[float], b: list[float]) -> float:
+    """Pearson correlation of the most recent min(len(a), len(b)) samples,
+    clipped to 0..1 (a negative/anti-phase correlation isn't "more out of
+    sync" for our purposes — it's just not togetherness — so it reads as 0,
+    same as no correlation at all). Returns 0.0 if either series is too
+    short/flat to correlate (e.g. one device hasn't moved at all yet).
+
+    Note: this compares each buffer's last N samples positionally, not by
+    matching timestamps — the two devices sample at ~10Hz independently and
+    aren't guaranteed to align exactly. Good enough for an MVP "are they
+    moving together" signal; true time-alignment/resampling can follow if
+    testing shows this drifts.
+    """
+    n = min(len(a), len(b))
+    if n < 3:
+        return 0.0
+    a = a[-n:]
+    b = b[-n:]
+    mean_a = sum(a) / n
+    mean_b = sum(b) / n
+    cov = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(n))
+    var_a = sum((x - mean_a) ** 2 for x in a)
+    var_b = sum((x - mean_b) ** 2 for x in b)
+    denom = math.sqrt(var_a * var_b)
+    if denom < 1e-9:
+        return 0.0
+    return max(0.0, cov / denom)
 
 
 @dataclass
@@ -61,6 +92,16 @@ class VoiceParameterStore:
     control surfaces (MIDI/OSC/Web) set gain/pan/phase.
     """
 
+    # Template for a never-yet-seen hybrid device — copied, never mutated in place.
+    _HYBRID_DEVICE_DEFAULTS = {
+        "bpm": 0.0, "rr_ms": 0.0, "confidence": 0.0,
+        "yaw": 0.0, "pitch": 0.0, "roll": 0.0,
+        "ax": 0.0, "ay": 0.0, "az": 0.0,
+    }
+    # Rolling window for sway-energy/synchrony — long enough to smooth a slow
+    # embrace-sway, short enough to feel live rather than laggy.
+    _HYBRID_MOTION_WINDOW_S = 2.0
+
     def __init__(self, on_change: Optional[Callable[[], None]] = None):
         self._lock = threading.RLock()
         self._voices: dict[int, VoiceParams] = {}
@@ -83,20 +124,21 @@ class VoiceParameterStore:
         self._strum_times: list[float] = []       # recent strum timestamps
         self._on_change = on_change
         self._panic_callback: Optional[Callable[[], None]] = None
-        # ─── Hybrid sensor state ───────────────────────────────────────────
-        self._hybrid_mode: int = 0              # 0=HR, 1=IMU, 2=Hybrid
-        self._hybrid_bpm: float = 0.0
-        self._hybrid_rr_ms: float = 0.0
-        self._hybrid_confidence: float = 0.0
-        self._hybrid_yaw: float = 0.0
-        self._hybrid_pitch: float = 0.0
-        self._hybrid_roll: float = 0.0
-        self._hybrid_ax: float = 0.0
-        self._hybrid_ay: float = 0.0
-        self._hybrid_az: float = 0.0
+        # ─── Hybrid sensor state (one entry per connected device, e.g. "A"/"B") ──
+        self._hybrid_mode: int = 0              # 0=HR, 1=IMU, 2=Hybrid — global, not per-device
+        self._hybrid_devices: dict[str, dict] = {}
         self._hybrid_clock_ts: float = 0.0
         self._hybrid_clock_seq: int = 0
         self._hybrid_bpm_ref: float = config.HYBRID_BPM_REF
+        # Rolling per-device accel-magnitude history, for sway-energy (RMS)
+        # and pair-synchrony (cross-correlation) — see the hug/dance roadmap's
+        # Phase 1. Keyed by device id; each value is a deque of (t, accel_mag).
+        self._hybrid_motion_history: dict[str, collections.deque] = {}
+        # Live control knob (not derived from motion): multiplier on
+        # config.HYBRID_PAIR_YAW_PAN_RANGE, 1.0 = 100% = default depth.
+        # Settable at runtime (dashboard slider) without restarting the
+        # audio engine, for field-testing how strongly yaw should pan.
+        self._hybrid_pan_sensitivity: float = 1.0
 
     # ─── Internal helpers ─────────────────────────────────────────────────
 
@@ -342,23 +384,43 @@ class VoiceParameterStore:
             self._hybrid_clock_seq = seq
             self._hybrid_bpm_ref = bpm_ref
 
-    def update_hybrid_hr(self, bpm: float, rr_ms: float, confidence: float = 1.0) -> None:
+    def _ensure_hybrid_device(self, device: str) -> dict:
+        """Must be called with self._lock already held."""
+        if device not in self._hybrid_devices:
+            self._hybrid_devices[device] = dict(self._HYBRID_DEVICE_DEFAULTS)
+        return self._hybrid_devices[device]
+
+    def update_hybrid_hr(self, bpm: float, rr_ms: float, confidence: float = 1.0,
+                          device: str = "A") -> None:
         with self._lock:
-            self._hybrid_bpm = bpm
-            self._hybrid_rr_ms = rr_ms
-            self._hybrid_confidence = confidence
+            d = self._ensure_hybrid_device(device)
+            d["bpm"] = bpm
+            d["rr_ms"] = rr_ms
+            d["confidence"] = confidence
         self._notify()
 
     def update_hybrid_imu(self, yaw: float, pitch: float, roll: float,
-                          ax: float, ay: float, az: float) -> None:
+                          ax: float, ay: float, az: float, device: str = "A") -> None:
         with self._lock:
-            self._hybrid_yaw = yaw
-            self._hybrid_pitch = pitch
-            self._hybrid_roll = roll
-            self._hybrid_ax = ax
-            self._hybrid_ay = ay
-            self._hybrid_az = az
+            d = self._ensure_hybrid_device(device)
+            d["yaw"] = yaw
+            d["pitch"] = pitch
+            d["roll"] = roll
+            d["ax"] = ax
+            d["ay"] = ay
+            d["az"] = az
+            accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+            self._record_motion_sample(device, accel_mag)
         self._notify()
+
+    def _record_motion_sample(self, device: str, accel_mag: float) -> None:
+        """Must be called with self._lock already held."""
+        now = time.time()
+        hist = self._hybrid_motion_history.setdefault(device, collections.deque())
+        hist.append((now, accel_mag))
+        cutoff = now - self._HYBRID_MOTION_WINDOW_S
+        while hist and hist[0][0] < cutoff:
+            hist.popleft()
 
     def set_hybrid_mode(self, mode: int) -> None:
         with self._lock:
@@ -366,19 +428,91 @@ class VoiceParameterStore:
         self._notify()
 
     # ─── Hybrid sensor getters (for audio engine + API) ─────────────────────────
+    # `device` defaults to "A" — the single-phone/single-strap case behaves
+    # exactly as before multi-device support existed.
 
-    def get_hybrid_hr(self) -> tuple[float, float, float]:
+    def get_hybrid_hr(self, device: str = "A") -> tuple[float, float, float]:
         with self._lock:
-            return self._hybrid_bpm, self._hybrid_rr_ms, self._hybrid_confidence
+            d = self._hybrid_devices.get(device, self._HYBRID_DEVICE_DEFAULTS)
+            return d["bpm"], d["rr_ms"], d["confidence"]
 
-    def get_hybrid_imu(self) -> tuple[float, float, float, float, float, float]:
+    def get_hybrid_imu(self, device: str = "A") -> tuple[float, float, float, float, float, float]:
         with self._lock:
-            return (self._hybrid_yaw, self._hybrid_pitch, self._hybrid_roll,
-                    self._hybrid_ax, self._hybrid_ay, self._hybrid_az)
+            d = self._hybrid_devices.get(device, self._HYBRID_DEVICE_DEFAULTS)
+            return (d["yaw"], d["pitch"], d["roll"], d["ax"], d["ay"], d["az"])
+
+    def get_hybrid_devices(self) -> list[str]:
+        """IDs of every device that has sent at least one reading so far."""
+        with self._lock:
+            return list(self._hybrid_devices.keys())
 
     def get_hybrid_mode(self) -> int:
         with self._lock:
             return self._hybrid_mode
+
+    # ─── Derived pair variables (Phase 1 of the hug/dance roadmap) ──────────────
+    # Computed from the rolling motion-history buffers above. None of these
+    # are consumed by the audio engine yet — that's Phase 2's per-person
+    # sound mapping. For now they're queryable (and dashboard-visible) so the
+    # numbers can be sanity-checked against real slow-dance motion first.
+
+    def get_hybrid_sway_energy(self, device: str = "A") -> float:
+        """RMS of accel magnitude over the rolling window — "how much is
+        this person moving right now." 0.0 if the device hasn't reported yet."""
+        with self._lock:
+            hist = self._hybrid_motion_history.get(device)
+            if not hist:
+                return 0.0
+            values = [v for _, v in hist]
+        return math.sqrt(sum(v * v for v in values) / len(values))
+
+    def get_hybrid_pair_energy(self, device_a: str = "A", device_b: str = "B") -> float:
+        """Mean of both devices' sway energy — overall "aliveness" of the pair."""
+        return (self.get_hybrid_sway_energy(device_a) + self.get_hybrid_sway_energy(device_b)) / 2.0
+
+    def get_hybrid_synchrony(self, device_a: str = "A", device_b: str = "B") -> float:
+        """0..1: how correlated the two devices' recent motion is — NOT a
+        distance measurement, a "moving as one vs. independently" signal.
+        0.0 if either device lacks enough samples yet (session just started,
+        or the other phone never connected)."""
+        with self._lock:
+            hist_a = self._hybrid_motion_history.get(device_a)
+            hist_b = self._hybrid_motion_history.get(device_b)
+            if not hist_a or not hist_b:
+                return 0.0
+            a = [v for _, v in hist_a]
+            b = [v for _, v in hist_b]
+        return _pearson_correlation(a, b)
+
+    def get_hybrid_relative_facing(self, device_a: str = "A", device_b: str = "B") -> float:
+        """Difference between the two devices' yaw, wrapped to -180..180.
+
+        Each phone zeros its own yaw client-side when its wearer taps Start
+        (see hybrid_bridge.py's sender page), so this is NOT an absolute
+        compass-bearing difference — it's how much the pair's relative
+        orientation has drifted since they began (0.0 at calibration time
+        for both, growing as they turn relative to each other). 0.0 if
+        either device hasn't reported yet.
+        """
+        with self._lock:
+            if device_a not in self._hybrid_devices or device_b not in self._hybrid_devices:
+                return 0.0
+            yaw_a = self._hybrid_devices[device_a]["yaw"]
+            yaw_b = self._hybrid_devices[device_b]["yaw"]
+        return (yaw_a - yaw_b + 180.0) % 360.0 - 180.0
+
+    def set_hybrid_pan_sensitivity(self, value: float) -> None:
+        """0..3 multiplier on config.HYBRID_PAIR_YAW_PAN_RANGE — a live
+        control knob, not derived from motion. 3.0 (300%) cap is generous
+        headroom for testing; actual audible pan still clamps to ±1 at the
+        point of use."""
+        with self._lock:
+            self._hybrid_pan_sensitivity = max(0.0, min(3.0, float(value)))
+        self._notify()
+
+    def get_hybrid_pan_sensitivity(self) -> float:
+        with self._lock:
+            return self._hybrid_pan_sensitivity
 
     # ─── Panic ───────────────────────────────────────────────────────────────
 
@@ -390,10 +524,9 @@ class VoiceParameterStore:
                 v.pan = 0.0
                 v.phase = 0.0
             self._active_history.clear()
-            # Reset hybrid state
-            self._hybrid_bpm = 0.0
-            self._hybrid_yaw = 0.0
-            self._hybrid_pitch = 0.0
+            # Reset hybrid state — drop every device, not just one.
+            self._hybrid_devices.clear()
+            self._hybrid_motion_history.clear()
         self._notify()
         # Also notify the MIDI control (Launchpad) to clear lights + state
         if self._panic_callback:
@@ -429,15 +562,28 @@ class VoiceParameterStore:
                 "strum_period_s": round(self._strum_period_s, 3),
                 "hybrid": {
                     "mode": self._hybrid_mode,
-                    "bpm": self._hybrid_bpm,
-                    "rr_ms": self._hybrid_rr_ms,
-                    "confidence": self._hybrid_confidence,
-                    "yaw": self._hybrid_yaw,
-                    "pitch": self._hybrid_pitch,
-                    "roll": self._hybrid_roll,
-                    "ax": self._hybrid_ax,
-                    "ay": self._hybrid_ay,
-                    "az": self._hybrid_az,
+                    # Legacy flat fields mirror device "A", so the existing
+                    # single-device dashboard panel keeps working unchanged.
+                    **self._hybrid_devices.get("A", self._HYBRID_DEVICE_DEFAULTS),
+                    # Full per-device breakdown, for multi-device UI/mapping.
+                    "devices": {
+                        dev_id: dict(vals)
+                        for dev_id, vals in self._hybrid_devices.items()
+                    },
+                    # Pair-derived variables (hardcoded to the "A"/"B" pair —
+                    # this MVP is two dancers, not N; see Phase 1 of the
+                    # hug/dance roadmap). Consumed by the audio engine only
+                    # when Pair Mode is on (config.HYBRID_PAIR_MODE_ENABLED).
+                    "derived": {
+                        "sway_energy_a": round(self.get_hybrid_sway_energy("A"), 3),
+                        "sway_energy_b": round(self.get_hybrid_sway_energy("B"), 3),
+                        "pair_energy": round(self.get_hybrid_pair_energy(), 3),
+                        "pair_synchrony": round(self.get_hybrid_synchrony(), 3),
+                        "relative_facing_deg": round(self.get_hybrid_relative_facing(), 1),
+                    },
+                    # Live control knob, not derived from motion — see
+                    # set_hybrid_pan_sensitivity.
+                    "pan_sensitivity": round(self._hybrid_pan_sensitivity, 3),
                 },
                 "voices": {
                     str(k): {
