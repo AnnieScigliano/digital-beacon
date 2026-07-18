@@ -95,14 +95,64 @@ HR_CHAR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
 IMU_SENDER_HTML = """<!DOCTYPE html>
 <html>
 <head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <title>Beacon IMU</title>
   <style>
-    body { font-family: sans-serif; background: #111; color: #0f0; padding: 20px; }
-    button { font-size: 18px; padding: 15px; margin: 10px 0; width: 100%; }
-    #status { font-size: 14px; margin-top: 20px; }
-    .value { font-family: monospace; font-size: 16px; }
-    #deviceLabel { font-size: 16px; margin-bottom: 10px; color: #0ff; }
+    :root {
+      --color-a: #3498db;   /* same blue drawPairViz uses for device A */
+      --color-b: #e67e22;   /* same orange drawPairViz uses for device B */
+      --ok: #2ecc71;
+      --warn: #e67e22;
+      --err: #e74c3c;
+      --idle: #666;
+      --device-color: var(--color-a);
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      background: #0a0a0a; color: #eee; padding: 24px 20px 40px;
+      min-height: 100vh; margin: 0;
+    }
+    h2 { font-weight: 600; letter-spacing: 0.02em; margin: 0 0 20px; }
+    button {
+      font-size: 17px; font-weight: 600; padding: 16px; margin: 8px 0;
+      width: 100%; border-radius: 14px; border: 2px solid #333;
+      background: #1a1a1a; color: #eee; -webkit-tap-highlight-color: transparent;
+      transition: transform 0.08s ease, opacity 0.15s ease;
+    }
+    button:active { transform: scale(0.97); }
+    button:disabled { opacity: 0.35; }
+    #devicePicker button:nth-of-type(1) { border-color: var(--color-a); color: var(--color-a); }
+    #devicePicker button:nth-of-type(2) { border-color: var(--color-b); color: var(--color-b); }
+    #startBtn:not(:disabled) { border-color: var(--ok); color: var(--ok); }
+    #stopBtn:not(:disabled) { border-color: var(--err); color: var(--err); }
+    #deviceLabel {
+      font-size: 15px; font-weight: 600; margin-bottom: 14px;
+      color: var(--device-color); letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    #statusRow { display: flex; align-items: center; gap: 8px; margin-top: 22px; font-size: 14px; color: #999; }
+    #statusDot {
+      width: 10px; height: 10px; border-radius: 50%; background: var(--idle);
+      flex-shrink: 0; transition: background 0.2s ease;
+    }
+    #wakeWarning {
+      display: none; margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+      background: rgba(230,126,34,0.12); border: 1px solid var(--warn);
+      color: var(--warn); font-size: 13px; line-height: 1.4;
+    }
+    #motionCanvas {
+      display: block; width: 100%; max-width: 260px; aspect-ratio: 1;
+      margin: 18px auto 4px; border-radius: 16px; background: #111;
+    }
+    .readout {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+      margin-top: 18px;
+    }
+    .stat {
+      background: #161616; border-radius: 12px; padding: 10px 6px; text-align: center;
+    }
+    .stat .label { display: block; font-size: 10px; letter-spacing: 0.08em; color: #777; text-transform: uppercase; }
+    .stat .val { display: block; font-family: "SF Mono", ui-monospace, monospace; font-size: 17px; margin-top: 4px; color: var(--device-color); }
   </style>
 </head>
 <body>
@@ -118,22 +168,189 @@ IMU_SENDER_HTML = """<!DOCTYPE html>
     <button id="stopBtn" onclick="stop()" disabled>Stop</button>
     <button id="recalBtn" onclick="recalibrate()" disabled>Recalibrate (face partner, stand still)</button>
   </div>
-  <div id="status">Status: idle</div>
-  <div id="data"></div>
+  <canvas id="motionCanvas"></canvas>
+  <div id="statusRow"><span id="statusDot"></span><span id="statusText">idle</span></div>
+  <div id="wakeWarning">
+    This phone can't be kept awake automatically — please disable auto-lock
+    (Settings) or it will stop sending data once the screen locks.
+  </div>
+  <div class="readout">
+    <div class="stat"><span class="label">Yaw</span><span class="val" id="valYaw">0.0°</span></div>
+    <div class="stat"><span class="label">Pitch</span><span class="val" id="valPitch">0.0°</span></div>
+    <div class="stat"><span class="label">Roll</span><span class="val" id="valRoll">0.0°</span></div>
+    <div class="stat"><span class="label">Ax</span><span class="val" id="valAx">0.00</span></div>
+    <div class="stat"><span class="label">Ay</span><span class="val" id="valAy">0.00</span></div>
+    <div class="stat"><span class="label">Az</span><span class="val" id="valAz">9.80</span></div>
+  </div>
 
 <script>
 let device = new URLSearchParams(location.search).get('device');
 let interval = null;
-const status = document.getElementById('status');
-const dataDiv = document.getElementById('data');
+let streaming = false;
+const statusText = document.getElementById('statusText');
+const statusDot = document.getElementById('statusDot');
+const wakeWarning = document.getElementById('wakeWarning');
+
+// Same hex values as --color-a/--color-b above (and drawPairViz on the
+// dashboard) — duplicated as RGB triples because canvas fillStyle needs an
+// alpha-blendable color and reading resolved CSS custom properties back
+// out in JS is unreliable across browsers.
+const COLOR_A_RGB = '52,152,219';
+const COLOR_B_RGB = '230,126,34';
+let deviceRGB = COLOR_A_RGB;
+
+function setStatus(text, color) {
+  statusText.textContent = text;
+  statusDot.style.background = color || 'var(--idle)';
+}
 
 function pickDevice(d) {
   device = d;
   document.getElementById('devicePicker').style.display = 'none';
   document.getElementById('controls').style.display = 'block';
   document.getElementById('deviceLabel').textContent = 'Phone ' + device;
+  document.documentElement.style.setProperty(
+    '--device-color', d === 'B' ? 'var(--color-b)' : 'var(--color-a)'
+  );
+  deviceRGB = d === 'B' ? COLOR_B_RGB : COLOR_A_RGB;
 }
 if (device) { pickDevice(device); }
+
+// ─── Local motion visualization (Phase 2) ──────────────────────────────
+// Purely local rendering — no extra network calls. A needle shows zeroed
+// yaw (the same "facing" concept the dashboard's pair canvas uses) and a
+// halo pulses with sway energy, computed here the same way
+// VoiceParameterStore.get_hybrid_sway_energy does server-side (RMS of
+// accel magnitude over a rolling window) so this is a faithful preview of
+// what the pair canvas will show, not just a decoration.
+const MOTION_WINDOW_MS = 2000;  // must match state.py's _HYBRID_MOTION_WINDOW_S
+const SWAY_REF = 3.0;           // must match config.HYBRID_PAIR_ENERGY_REF
+let motionHistory = [];
+
+function pushMotionSample(mag) {
+  const now = performance.now();
+  motionHistory.push([now, mag]);
+  const cutoff = now - MOTION_WINDOW_MS;
+  while (motionHistory.length && motionHistory[0][0] < cutoff) motionHistory.shift();
+}
+
+function localSwayEnergy() {
+  if (!motionHistory.length) return 0;
+  const sumSq = motionHistory.reduce((s, [, v]) => s + v * v, 0);
+  return Math.sqrt(sumSq / motionHistory.length);
+}
+
+let motionCtx = null, motionSize = 260;
+
+function setupCanvas() {
+  const canvas = document.getElementById('motionCanvas');
+  const dpr = window.devicePixelRatio || 1;
+  const cssSize = canvas.getBoundingClientRect().width || 260;
+  canvas.width = cssSize * dpr;
+  canvas.height = cssSize * dpr;
+  motionCtx = canvas.getContext('2d');
+  motionCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  motionSize = cssSize;
+}
+window.addEventListener('resize', setupCanvas);
+window.addEventListener('orientationchange', setupCanvas);
+setupCanvas();
+
+function drawMotion() {
+  if (!motionCtx) return;
+  const ctx = motionCtx, s = motionSize, cx = s / 2, cy = s / 2;
+  ctx.clearRect(0, 0, s, s);
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, s, s);
+
+  const swayNorm = Math.min(localSwayEnergy() / SWAY_REF, 1.0);
+  const baseR = s * 0.28;
+  const haloR = baseR + swayNorm * s * 0.18;
+
+  // Halo: grows and brightens with sway energy (0 = still, 1 = full-scale motion)
+  ctx.beginPath();
+  ctx.fillStyle = `rgba(${deviceRGB},${(0.10 + swayNorm * 0.28).toFixed(3)})`;
+  ctx.arc(cx, cy, haloR, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Static ring + a top tick marking the calibrated "forward" reference (yaw=0)
+  ctx.beginPath();
+  ctx.strokeStyle = `rgba(${deviceRGB},0.45)`;
+  ctx.lineWidth = 2;
+  ctx.arc(cx, cy, baseR, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.lineWidth = 1;
+  ctx.moveTo(cx, cy - baseR - 6);
+  ctx.lineTo(cx, cy - baseR + 6);
+  ctx.stroke();
+
+  // Needle: rotates with zeroed yaw — snaps back to 12 o'clock on Recalibrate
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate((yaw * Math.PI) / 180);
+  const needleLen = baseR * 0.9;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -needleLen);
+  ctx.strokeStyle = `rgb(${deviceRGB})`;
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(0, -needleLen, 5, 0, Math.PI * 2);
+  ctx.fillStyle = `rgb(${deviceRGB})`;
+  ctx.fill();
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.fillStyle = '#eee';
+  ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  requestAnimationFrame(drawMotion);
+}
+requestAnimationFrame(drawMotion);
+
+// ─── Screen Wake Lock ───────────────────────────────────────────────────
+// Without this, iOS/Android will dim then lock the screen after their
+// normal inactivity timeout — and on iOS, a locked/backgrounded Safari tab
+// stops firing deviceorientation/devicemotion entirely (and pauses the
+// sendData() interval), so the phone silently stops sending data mid-dance.
+// The Wake Lock API keeps the screen ON (not off — there's no web API to
+// keep sensors alive with the screen off) for as long as this tab stays
+// foregrounded. It requires a secure (HTTPS) context, same as the iOS
+// motion-permission prompt above — already satisfied by the cloudflared
+// tunnel this page is served through.
+let wakeLock = null;
+
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) {
+    wakeWarning.style.display = 'block';
+    return;
+  }
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeWarning.style.display = 'none';
+    wakeLock.addEventListener('release', () => {
+      // Fires when the OS/browser reclaims it (e.g. tab backgrounded) —
+      // re-requested by the visibilitychange handler below once we're
+      // foregrounded again, not from here (this listener has no gesture).
+      wakeLock = null;
+    });
+  } catch (err) {
+    // Most common cause: non-secure context, or the page lost visibility
+    // between the call starting and resolving.
+    wakeWarning.style.display = 'block';
+  }
+}
+
+document.addEventListener('visibilitychange', async () => {
+  if (streaming && document.visibilityState === 'visible' && wakeLock === null) {
+    await requestWakeLock();
+  }
+});
 
 async function start() {
   if (typeof DeviceMotionEvent !== 'undefined' &&
@@ -141,27 +358,31 @@ async function start() {
     // iOS 13+ requires an explicit user-gesture permission request.
     const resp = await DeviceMotionEvent.requestPermission().catch(() => 'denied');
     if (resp !== 'granted') {
-      status.textContent = 'Status: motion permission denied';
+      setStatus('motion permission denied', 'var(--err)');
       return;
     }
   }
   window.addEventListener('deviceorientation', handleOrientation);
   window.addEventListener('devicemotion', handleMotion);
   interval = setInterval(sendData, 100); // 10 Hz
+  streaming = true;
+  await requestWakeLock();
   document.getElementById('startBtn').disabled = true;
   document.getElementById('stopBtn').disabled = false;
   document.getElementById('recalBtn').disabled = false;
-  status.textContent = 'Status: streaming @ 10Hz (calibrating on first reading)';
+  setStatus('streaming @ 10Hz (calibrating...)', 'var(--ok)');
 }
 
 function stop() {
   window.removeEventListener('deviceorientation', handleOrientation);
   window.removeEventListener('devicemotion', handleMotion);
   clearInterval(interval);
+  streaming = false;
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
   document.getElementById('startBtn').disabled = false;
   document.getElementById('stopBtn').disabled = true;
   document.getElementById('recalBtn').disabled = true;
-  status.textContent = 'Status: stopped';
+  setStatus('stopped', 'var(--idle)');
 }
 
 // Yaw/pitch are reported relative to wherever the wearer was facing/tilted
@@ -178,7 +399,7 @@ function wrap180(deg) {
 function recalibrate() {
   yawZero = null;
   pitchZero = null;
-  status.textContent = 'Status: recalibrating on next reading...';
+  setStatus('recalibrating on next reading...', 'var(--warn)');
 }
 
 let yaw = 0, pitch = 0, roll = 0, ax = 0, ay = 0, az = 9.8;
@@ -197,6 +418,7 @@ function handleMotion(e) {
   ax = a.x || 0;
   ay = a.y || 0;
   az = a.z || 9.8;
+  pushMotionSample(Math.sqrt(ax * ax + ay * ay + az * az));
 }
 
 function sendData() {
@@ -207,9 +429,16 @@ function sendData() {
     body: JSON.stringify(payload)
   }).then(r => r.json())
     .then(j => {
-      dataDiv.innerHTML = `<span class="value">[${device}] Y:${yaw.toFixed(1)} P:${pitch.toFixed(1)} R:${roll.toFixed(1)} | A:${ax.toFixed(2)},${ay.toFixed(2)},${az.toFixed(2)}</span>`;
+      document.getElementById('valYaw').textContent = yaw.toFixed(1) + '°';
+      document.getElementById('valPitch').textContent = pitch.toFixed(1) + '°';
+      document.getElementById('valRoll').textContent = roll.toFixed(1) + '°';
+      document.getElementById('valAx').textContent = ax.toFixed(2);
+      document.getElementById('valAy').textContent = ay.toFixed(2);
+      document.getElementById('valAz').textContent = az.toFixed(2);
+      setStatus('streaming @ 10Hz' + (wakeLock ? '' : ' (screen-lock not held)'),
+                 wakeLock ? 'var(--ok)' : 'var(--warn)');
     })
-    .catch(e => { status.textContent = 'Error: ' + e.message; });
+    .catch(e => { setStatus('error: ' + e.message, 'var(--err)'); });
 }
 </script>
 </body>
