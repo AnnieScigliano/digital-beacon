@@ -53,10 +53,10 @@ HYBRID_ACCEL_GAIN_BOOST = 0.35  # accel magnitude → gain boost (legacy single-
 # ─── Hybrid Pair Mode (two-phone hug/dance MVP, Phase 2) ────────────────────
 # Splits the 32 harmonics into per-person registers plus a shared "bloom"
 # band, so each dancer's own motion is audibly theirs instead of the whole
-# field moving together. OPT-IN and OFF by default — the single-device
-# Hybrid mode used by everything built before this (whole-field yaw
-# rotation + HR gain/shape) is completely unaffected unless this is flipped
-# on. When it IS on, HR is intentionally excluded from the mapping
+# field moving together. This Pair Mode source branch selects True in Python
+# and both SC files. To select the legacy single-device Hybrid path instead,
+# deliberately choose False in the receiving engines. When True, HR is
+# intentionally excluded from the mapping
 # entirely, even if HR data happens to be running — this mode is scoped to
 # phone movement only (no heart-rate hardware assumed or simulated).
 HYBRID_PAIR_MODE_ENABLED = True

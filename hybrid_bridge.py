@@ -120,6 +120,7 @@ IMU_SENDER_HTML = """<!DOCTYPE html>
       background: #1a1a1a; color: #eee; -webkit-tap-highlight-color: transparent;
       transition: transform 0.08s ease, opacity 0.15s ease;
     }
+    button:focus-visible { outline: 3px solid #f1cf9e; outline-offset: 4px; }
     button:active { transform: scale(0.97); }
     button:disabled { opacity: 0.35; }
     #devicePicker button:nth-of-type(1) { border-color: var(--color-a); color: var(--color-a); }
@@ -138,7 +139,7 @@ IMU_SENDER_HTML = """<!DOCTYPE html>
     #wakeWarning {
       display: none; margin-top: 10px; padding: 10px 12px; border-radius: 10px;
       background: rgba(230,126,34,0.12); border: 1px solid var(--warn);
-      color: var(--warn); font-size: 13px; line-height: 1.4;
+      color: var(--warn); font-size: 14px; line-height: 1.4;
     }
     #motionCanvas {
       display: block; width: 100%; max-width: 260px; aspect-ratio: 1;
@@ -151,7 +152,7 @@ IMU_SENDER_HTML = """<!DOCTYPE html>
     .stat {
       background: #161616; border-radius: 12px; padding: 10px 6px; text-align: center;
     }
-    .stat .label { display: block; font-size: 10px; letter-spacing: 0.08em; color: #777; text-transform: uppercase; }
+    .stat .label { display: block; font-size: 14px; letter-spacing: 0.04em; color: #b5b5b5; text-transform: uppercase; }
     .stat .val { display: block; font-family: "SF Mono", ui-monospace, monospace; font-size: 17px; margin-top: 4px; color: var(--device-color); }
   </style>
 </head>
@@ -175,16 +176,17 @@ IMU_SENDER_HTML = """<!DOCTYPE html>
     (Settings) or it will stop sending data once the screen locks.
   </div>
   <div class="readout">
-    <div class="stat"><span class="label">Yaw</span><span class="val" id="valYaw">0.0°</span></div>
-    <div class="stat"><span class="label">Pitch</span><span class="val" id="valPitch">0.0°</span></div>
-    <div class="stat"><span class="label">Roll</span><span class="val" id="valRoll">0.0°</span></div>
-    <div class="stat"><span class="label">Ax</span><span class="val" id="valAx">0.00</span></div>
-    <div class="stat"><span class="label">Ay</span><span class="val" id="valAy">0.00</span></div>
-    <div class="stat"><span class="label">Az</span><span class="val" id="valAz">9.80</span></div>
+    <div class="stat"><span class="label">Yaw</span><span class="val" id="valYaw">—</span></div>
+    <div class="stat"><span class="label">Pitch</span><span class="val" id="valPitch">—</span></div>
+    <div class="stat"><span class="label">Roll</span><span class="val" id="valRoll">—</span></div>
+    <div class="stat"><span class="label">Ax</span><span class="val" id="valAx">—</span></div>
+    <div class="stat"><span class="label">Ay</span><span class="val" id="valAy">—</span></div>
+    <div class="stat"><span class="label">Az</span><span class="val" id="valAz">—</span></div>
   </div>
 
 <script>
 let device = new URLSearchParams(location.search).get('device');
+if (!['A','B'].includes(device)) device = null;
 let interval = null;
 let streaming = false;
 const statusText = document.getElementById('statusText');
@@ -235,7 +237,9 @@ function pushMotionSample(mag) {
 }
 
 function localSwayEnergy() {
-  if (!motionHistory.length) return 0;
+  const cutoff = performance.now() - MOTION_WINDOW_MS;
+  while (motionHistory.length && motionHistory[0][0] < cutoff) motionHistory.shift();
+  if (!motionHistory.length || performance.now() - lastMotionMs > SENSOR_FRESH_MS) return 0;
   const sumSq = motionHistory.reduce((s, [, v]) => s + v * v, 0);
   return Math.sqrt(sumSq / motionHistory.length);
 }
@@ -332,6 +336,7 @@ async function requestWakeLock() {
   }
   try {
     wakeLock = await navigator.wakeLock.request('screen');
+    if (!streaming) { await wakeLock.release(); wakeLock = null; return; }
     wakeWarning.style.display = 'none';
     wakeLock.addEventListener('release', () => {
       // Fires when the OS/browser reclaims it (e.g. tab backgrounded) —
@@ -352,32 +357,55 @@ document.addEventListener('visibilitychange', async () => {
   }
 });
 
+let starting = false, streamId = '', sampleSeq = 0, sending = false;
+let lastMotionMs = -Infinity, lastOrientationMs = -Infinity;
+const SENSOR_FRESH_MS = 750;
 async function start() {
-  if (typeof DeviceMotionEvent !== 'undefined' &&
-      typeof DeviceMotionEvent.requestPermission === 'function') {
-    // iOS 13+ requires an explicit user-gesture permission request.
-    const resp = await DeviceMotionEvent.requestPermission().catch(() => 'denied');
-    if (resp !== 'granted') {
-      setStatus('motion permission denied', 'var(--err)');
-      return;
-    }
-  }
-  window.addEventListener('deviceorientation', handleOrientation);
-  window.addEventListener('devicemotion', handleMotion);
-  interval = setInterval(sendData, 100); // 10 Hz
-  streaming = true;
-  await requestWakeLock();
+  if (streaming || starting) return;
+  starting = true;
   document.getElementById('startBtn').disabled = true;
-  document.getElementById('stopBtn').disabled = false;
-  document.getElementById('recalBtn').disabled = false;
-  setStatus('streaming @ 10Hz (calibrating...)', 'var(--ok)');
+  try {
+    if (!window.isSecureContext) throw Error('Open this page over HTTPS or localhost.');
+    if (!globalThis.DeviceMotionEvent || !globalThis.DeviceOrientationEvent) throw Error('Motion/orientation sensors are not available.');
+    // Request both permissions within this user gesture (where required).
+    const permissions = [globalThis.DeviceMotionEvent, globalThis.DeviceOrientationEvent]
+      .filter(type => typeof type.requestPermission === 'function')
+      .map(type => type.requestPermission());
+    if ((await Promise.all(permissions)).some(value => value !== 'granted')) throw Error('Sensor permission denied.');
+    streamId = crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(16).slice(2);
+    sampleSeq = 0;
+    yawZero = null; pitchZero = null; motionHistory = [];
+    lastMotionMs = lastOrientationMs = -Infinity;
+    window.addEventListener('deviceorientation', handleOrientation);
+    window.addEventListener('devicemotion', handleMotion);
+    streaming = true;
+    interval = setInterval(sendData, 100);
+    await requestWakeLock();
+    if (!streaming) return;
+    document.getElementById('stopBtn').disabled = false;
+    document.getElementById('recalBtn').disabled = false;
+    setStatus('Waiting for fresh sensor readings…', 'var(--warn)');
+  } catch (error) {
+    setStatus(error.message, 'var(--err)');
+  } finally {
+    starting = false;
+    document.getElementById('startBtn').disabled = streaming;
+  }
 }
 
 function stop() {
+  const wasStreaming = streaming;
   window.removeEventListener('deviceorientation', handleOrientation);
   window.removeEventListener('devicemotion', handleMotion);
   clearInterval(interval);
   streaming = false;
+  lastMotionMs = lastOrientationMs = -Infinity;
+  motionHistory = [];
+  for (const name of ['Yaw','Pitch','Roll','Ax','Ay','Az']) document.getElementById('val'+name).textContent = '—';
+  if (wasStreaming) fetch('/pair/disconnect', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({device, stream:streamId}), keepalive: true
+  }).catch(() => {}); // Optional receiver; independent expiry also releases the role.
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
   document.getElementById('startBtn').disabled = false;
   document.getElementById('stopBtn').disabled = true;
@@ -399,36 +427,59 @@ function wrap180(deg) {
 function recalibrate() {
   yawZero = null;
   pitchZero = null;
+  lastOrientationMs = -Infinity;
+  motionHistory = [];
   setStatus('recalibrating on next reading...', 'var(--warn)');
 }
 
-let yaw = 0, pitch = 0, roll = 0, ax = 0, ay = 0, az = 9.8;
+let yaw = 0, pitch = 0, roll = 0, ax = 0, ay = 0, az = 0;
 
 function handleOrientation(e) {
-  const rawYaw = e.alpha || 0;
-  const rawPitch = e.beta || 0;
+  if (![e.alpha,e.beta,e.gamma].every(Number.isFinite)) {
+    lastOrientationMs = -Infinity; return;
+  }
+  const rawYaw = e.alpha, rawPitch = e.beta;
   if (yawZero === null) { yawZero = rawYaw; pitchZero = rawPitch; }
   yaw = wrap180(rawYaw - yawZero);
   pitch = rawPitch - pitchZero;
-  roll = e.gamma || 0;
+  roll = e.gamma;
+  lastOrientationMs = performance.now();
 }
 
 function handleMotion(e) {
-  const a = e.acceleration || {};
-  ax = a.x || 0;
-  ay = a.y || 0;
-  az = a.z || 9.8;
+  const a = e.acceleration;
+  if (!a || ![a.x,a.y,a.z].every(Number.isFinite)) {
+    lastMotionMs = -Infinity; motionHistory = []; return;
+  }
+  // DeviceMotion.acceleration is linear m/s^2. A valid zero stays zero;
+  // missing data never becomes synthetic gravity or observed stillness.
+  ax = a.x; ay = a.y; az = a.z;
+  lastMotionMs = performance.now();
   pushMotionSample(Math.sqrt(ax * ax + ay * ay + az * az));
 }
+window.addEventListener('pagehide', stop);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden' && streaming) stop();
+});
 
 function sendData() {
-  const payload = { device, yaw, pitch, roll, ax, ay, az };
+  if (!streaming || sending) return;
+  const now = performance.now();
+  if (now - lastMotionMs > SENSOR_FRESH_MS || now - lastOrientationMs > SENSOR_FRESH_MS) {
+    setStatus('Waiting for fresh motion and orientation…', 'var(--warn)'); return;
+  }
+  const payload = { device, stream:streamId, seq:sampleSeq++, yaw, pitch, roll, ax, ay, az };
+  sending = true;
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 1000);
   fetch('/imu', {
+    signal: controller.signal,
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
-  }).then(r => r.json())
+  }).then(async r => { const j = await r.json(); if (!r.ok || j.ok === false) throw Error(j.error || 'Receiver refused the sample'); return j; })
     .then(j => {
+      if (!streaming) return;
       document.getElementById('valYaw').textContent = yaw.toFixed(1) + '°';
       document.getElementById('valPitch').textContent = pitch.toFixed(1) + '°';
       document.getElementById('valRoll').textContent = roll.toFixed(1) + '°';
@@ -438,8 +489,21 @@ function sendData() {
       setStatus('streaming @ 10Hz' + (wakeLock ? '' : ' (screen-lock not held)'),
                  wakeLock ? 'var(--ok)' : 'var(--warn)');
     })
-    .catch(e => { setStatus('error: ' + e.message, 'var(--err)'); });
+    .catch(e => { if (streaming) setStatus('error: ' + e.message, 'var(--err)'); })
+    .finally(() => { clearTimeout(deadline); sending = false; });
 }
+const partner = document.createElement('p');
+partner.style.cssText = 'font-size:16px;line-height:1.5;color:#ccd9df';
+partner.textContent = 'Pair rehearsal · partner state appears after Start';
+document.getElementById('controls').appendChild(partner);
+setInterval(async () => {
+  if (!streaming) return;
+  try {
+    const r = await fetch('/pair/status'); if (!r.ok) { partner.textContent = 'Partner status unavailable on this receiver'; return; }
+    const j = await r.json();
+    partner.textContent = ['A','B'].map(d => 'Phone ' + d + ': ' + (j.devices[d].online ? 'receiving' : 'waiting')).join(' · ');
+  } catch { partner.textContent = 'Partner state not confirmed'; }
+}, 1000);
 </script>
 </body>
 </html>

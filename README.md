@@ -1,5 +1,13 @@
 # digital-beacon / NaturalHarmony Toolkit
 
+## Two-phone rehearsal candidate
+
+For the movement-only Living Lab profile on this experimental branch, read
+[PAIR_REHEARSAL.md](PAIR_REHEARSAL.md). It reuses the existing additive Pair
+Mode mapping with explicit source freshness, phone permissions and an isolated
+foreground launcher. It does not require ECG/EEG, SC or the legacy start script.
+
+
 **The Harmonic Beacon as a modular software toolkit.** Natural harmonics, end-to-end.
 
 This repo is the new home of a unified toolkit built from:

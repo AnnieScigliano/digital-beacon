@@ -4,7 +4,7 @@ harmonic-register assignment, the per-person pan/gain math, and — end to
 end through the real audio callback — that device A's motion only audibly
 affects register A, device B's only register B, and the shared band stays
 silent until the pair is synchronized. Also covers the reverse: with pair
-mode at its default (disabled), the original single-device Hybrid mode
+mode explicitly disabled, the original single-device Hybrid mode
 (whole-field yaw rotation, HR-driven master pulse) must be completely
 unaffected — that's what everything built before this MVP relies on.
 
@@ -235,16 +235,26 @@ class TestHybridPairCallback(unittest.TestCase):
         self.assertGreater(synced_energy, desynced_energy)
 
 
-class TestLegacySingleDeviceModeUnaffected(unittest.TestCase):
-    """config.HYBRID_PAIR_MODE_ENABLED defaults to False — this is the
-    single-device Hybrid mode that predates the two-phone pair mapping, and
-    must behave exactly as it always has: one phone's yaw pans the WHOLE
-    32-band field (not just its own 10-harmonic register), and HR still
-    drives the master pulse. No setUp override here — this exercises the
-    real default."""
+class TestStoredPairConfiguration(unittest.TestCase):
+    def test_pair_branch_selects_pair_mode(self) -> None:
+        self.assertTrue(config.HYBRID_PAIR_MODE_ENABLED)
+        root = Path(__file__).resolve().parents[1]
+        for name in ('beacon.scd', 'beacon_simple.scd'):
+            self.assertIn('hybridPairModeEnabled = true', (root / name).read_text())
 
-    def test_pair_mode_defaults_to_disabled(self) -> None:
-        self.assertFalse(config.HYBRID_PAIR_MODE_ENABLED)
+
+class TestLegacySingleDeviceModeUnaffected(unittest.TestCase):
+    """Explicitly selecting legacy mode preserves its whole-field/HR behavior.
+
+    The preserved Pair Mode branch selects True. Do not confuse a legacy-mode
+    fixture with the branch's actual configuration; both are checked separately.
+    """
+    def setUp(self):
+        self.previous_mode = config.HYBRID_PAIR_MODE_ENABLED
+        config.HYBRID_PAIR_MODE_ENABLED = False
+
+    def tearDown(self):
+        config.HYBRID_PAIR_MODE_ENABLED = self.previous_mode
 
     def test_single_device_yaw_still_pans_the_whole_field(self) -> None:
         # Pick a harmonic OUTSIDE register A (e.g. one in B's, or the shared
@@ -263,7 +273,7 @@ class TestLegacySingleDeviceModeUnaffected(unittest.TestCase):
         r_energy = float(np.sum(mix[:, 1] ** 2))
         self.assertGreater(r_energy, l_energy)
 
-    def test_hr_still_drives_master_pulse_by_default(self) -> None:
+    def test_hr_still_drives_master_pulse_when_legacy_selected(self) -> None:
         n = next(iter(config.HYBRID_HARMONICS_A))
         store = VoiceParameterStore()
         store.voice_on(n, voice_id=1, freq=110.0, gain=0.3)
